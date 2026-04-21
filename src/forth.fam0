@@ -854,8 +854,8 @@ B7 82 02 00	# lui t0, 0x00028
 93 8C 4C 00	# addi s9, s9, 4
 93 89 49 00	# addi s3, s3, 4
 6F F0 4F B6	# j compile_loop
-B7 0E 80 82	# lui t4, 0x82800
-93 8E 0E 90	# addi t4, t4, 0x900
+B7 1E 80 82	# lui t4, 0x82801
+93 8E 0E F0	# addi t4, t4, -0x100
 93 0F 00 00	# addi t6, zero, 0
 93 8C CC FF	# addi s9, s9, -4
 83 A3 0C 00	# lw t2, 0(s9)
@@ -920,8 +920,8 @@ B7 8F 02 00	# lui t6, 0x00028
 33 6F FF 01	# or t5, t5, t6
 23 A0 E3 01	# sw t5, 0(t2)
 6F F0 CF A5	# j compile_loop
-B7 0E 80 82	# lui t4, 0x82800
-93 8E 0E 90	# addi t4, t4, 0x900
+B7 1E 80 82	# lui t4, 0x82801
+93 8E 0E F0	# addi t4, t4, -0x100
 93 0F 00 00	# addi t6, zero, 0
 93 8C CC FF	# addi s9, s9, -4
 83 A3 0C 00	# lw t2, 0(s9)
@@ -1119,8 +1119,8 @@ B7 12 4A 00	# lui t0, 0x004A1
 23 A0 3C 01	# sw s3, 0(s9)
 93 8C 4C 00	# addi s9, s9, 4
 6F E0 1F F4	# j compile_loop
-B7 0E 80 82	# lui t4, 0x82800
-93 8E 0E 90	# addi t4, t4, 0x900
+B7 1E 80 82	# lui t4, 0x82801
+93 8E 0E F0	# addi t4, t4, -0x100
 93 0F 00 00	# addi t6, zero, 0
 93 8C CC FF	# addi s9, s9, -4
 83 A3 0C 00	# lw t2, 0(s9)
@@ -1229,8 +1229,8 @@ B7 32 09 FF	# lui t0, 0xFF093
 23 A0 59 00	# sw t0, 0(s3)
 93 89 49 00	# addi s3, s3, 4
 6F E0 9F D8	# j compile_loop
-B7 0E 80 82	# lui t4, 0x82800
-93 8E 0E 90	# addi t4, t4, 0x900
+B7 1E 80 82	# lui t4, 0x82801
+93 8E 0E F0	# addi t4, t4, -0x100
 93 0F 00 00	# addi t6, zero, 0
 93 8C CC FF	# addi s9, s9, -4
 83 A3 0C 00	# lw t2, 0(s9)
@@ -1647,7 +1647,7 @@ B3 EF 5F 00	# or t6, t6, t0
 13 0E 00 00	# addi t3, zero, 0
 B7 0E 80 82	# lui t4, 0x82800
 93 8E 0E 90	# addi t4, t4, 0x900
-63 0C AE 09	# beq t3, s10, disp_done
+63 08 AE 09	# beq t3, s10, disp_done
 93 12 4E 01	# slli t0, t3, 20
 13 03 30 01	# addi t1, zero, 0x13
 13 63 03 28	# ori t1, t1, 0x280
@@ -1657,34 +1657,32 @@ B3 E2 62 00	# or t0, t0, t1
 13 1F 2E 00	# slli t5, t3, 2
 33 8F EE 01	# add t5, t4, t5
 03 2F 0F 00	# lw t5, 0(t5)
+B7 92 54 00	# lui t0, 0x00549
+93 82 32 46	# addi t0, t0, 0x463
+23 A0 59 00	# sw t0, 0(s3)
+93 89 49 00	# addi s3, s3, 4
 B3 0F 3F 41	# sub t6, t5, s3
-93 D2 CF 00	# srli t0, t6, 12
+93 D2 4F 01	# srli t0, t6, 20
 93 F2 12 00	# andi t0, t0, 1
 93 92 F2 01	# slli t0, t0, 31
-13 D3 5F 00	# srli t1, t6, 5
-13 73 F3 03	# andi t1, t1, 0x3F
-13 13 93 01	# slli t1, t1, 25
-B3 E2 62 00	# or t0, t0, t1
-13 03 50 00	# addi t1, zero, 5
-13 13 43 01	# slli t1, t1, 20
-B3 E2 62 00	# or t0, t0, t1
-13 03 90 00	# addi t1, zero, 9
-13 13 F3 00	# slli t1, t1, 15
-B3 E2 62 00	# or t0, t0, t1
 13 D3 1F 00	# srli t1, t6, 1
-13 73 F3 00	# andi t1, t1, 0xF
-13 13 83 00	# slli t1, t1, 8
+13 73 F3 3F	# andi t1, t1, 0x3FF
+13 13 53 01	# slli t1, t1, 21
 B3 E2 62 00	# or t0, t0, t1
 13 D3 BF 00	# srli t1, t6, 11
 13 73 13 00	# andi t1, t1, 1
-13 13 73 00	# slli t1, t1, 7
+13 13 43 01	# slli t1, t1, 20
 B3 E2 62 00	# or t0, t0, t1
-13 03 30 06	# addi t1, zero, 0x63
+13 D3 CF 00	# srli t1, t6, 12
+13 73 F3 0F	# andi t1, t1, 0xFF
+13 13 C3 00	# slli t1, t1, 12
+B3 E2 62 00	# or t0, t0, t1
+13 03 F0 06	# addi t1, zero, 0x6F
 B3 E2 62 00	# or t0, t0, t1
 23 A0 59 00	# sw t0, 0(s3)
 93 89 49 00	# addi s3, s3, 4
 13 0E 1E 00	# addi t3, t3, 1
-6F F0 DF F6	# j disp_loop
+6F F0 5F F7	# j disp_loop
 93 02 F0 06	# addi t0, zero, 0x6F
 23 A0 59 00	# sw t0, 0(s3)
 93 89 49 00	# addi s3, s3, 4

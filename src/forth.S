@@ -30,6 +30,7 @@
 #   0x82800100           = control flow stack (compile-time, 1024 bytes)
 #   0x82800500           = patch list (addresses needing dispatch fixup)
 #   0x82800900           = call site list (target addresses for dispatch table)
+#   0x82800F00           = leave scratch (temporary storage during loop/if compilation)
 #   0x83000000           = input buffer (source code)
 #   0x84000000           = output buffer (compiled binary)
 #
@@ -1401,8 +1402,8 @@ do_if:
 # Patch the forward branch from IF or ELSE to point here
 do_then:
     # Pop control stack, skipping leave markers (odd = leave, even = if-addr)
-    lui t4, 0x82800
-    addi t4, t4, 0x900
+    lui t4, 0x82801
+    addi t4, t4, -0x100
     addi t6, zero, 0
 then_skip_leaves:
     addi s9, s9, -4
@@ -1507,8 +1508,8 @@ patch_jal:
 # Patch the IF's branch to jump here (just past the jal)
 do_else:
     # Pop control stack, skipping leave markers
-    lui t4, 0x82800
-    addi t4, t4, 0x900
+    lui t4, 0x82801
+    addi t4, t4, -0x100
     addi t6, zero, 0
 else_skip_leaves:
     addi s9, s9, -4
@@ -1800,9 +1801,8 @@ do_do:
 # --- loop (counted loop end: increment index, branch if not done) ---
 do_loop:
     # Pop control stack entries: skip leave markers (odd), find do-body addr (even)
-    # Save leave addresses temporarily in call site area (reusable scratch)
-    lui t4, 0x82800
-    addi t4, t4, 0x900          # scratch area for leave addrs
+    lui t4, 0x82801
+    addi t4, t4, -0x100         # scratch area for leave addrs (0x82800F00)
     addi t6, zero, 0            # leave count
 loop_pop_cs:
     addi s9, s9, -4
@@ -1958,8 +1958,8 @@ emit_j:
 # Simplified: always use positive increment semantics (add TOS to index, compare)
 do_ploop:
     # Pop control stack entries: skip leave markers (odd), find do-body addr (even)
-    lui t4, 0x82800
-    addi t4, t4, 0x900          # scratch area for leave addrs
+    lui t4, 0x82801
+    addi t4, t4, -0x100         # scratch area for leave addrs (0x82800F00)
     addi t6, zero, 0            # leave count
 ploop_pop_cs:
     addi s9, s9, -4
@@ -2651,51 +2651,49 @@ disp_loop:
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # Emit: beq s1, t0, <offset to call_site>
+    # Emit: bne s1, t0, +8; jal x0, <call_site>
+    # This uses a trampoline because B-type (beq) is limited to ±4KB
+    # while J-type (jal) has ±1MB range.
+
     # Load call site address
     slli t5, t3, 2
     add t5, t4, t5
     lw t5, 0(t5)             # absolute address of call site
 
+    # Emit: bne x9, x5, +8 (skip over jal if ID doesn't match)
+    # B-type: imm=8, rs1=9, rs2=5, funct3=1
+    # b12=0, b11=0, b10:5=000000, rs2=5, rs1=9, funct3=1, b4:1=0100, b0=0, opcode=0x63
+    # = (0<<31)|(0<<25)|(5<<20)|(9<<15)|(1<<12)|(4<<8)|(0<<7)|0x63
+    # = 0x00549463
+    lui t0, 0x00549
+    addi t0, t0, 0x463
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Emit: jal x0, <offset to call_site>
     # offset = call_site_addr - current_output_pos
     sub t6, t5, s3
-    # Encode beq x9, x5, t6
-    # B-type: rs1=x9, rs2=x5, funct3=0
-    srli t0, t6, 12
+    # Encode J-type: jal x0, t6
+    srli t0, t6, 20
     andi t0, t0, 1
-    slli t0, t0, 31          # b12
+    slli t0, t0, 31          # b20
 
-    srli t1, t6, 5
-    andi t1, t1, 0x3F
-    slli t1, t1, 25          # b10:5
-    or t0, t0, t1
-
-    # rs2=x5 (bit 24:20)
-    addi t1, zero, 5
-    slli t1, t1, 20
-    or t0, t0, t1
-
-    # rs1=x9 (bits 19:15)
-    addi t1, zero, 9
-    slli t1, t1, 15
-    or t0, t0, t1
-
-    # funct3=0 (bits 14:12) — already 0
-
-    # b4:1 (bits 11:8)
     srli t1, t6, 1
-    andi t1, t1, 0xF
-    slli t1, t1, 8
+    andi t1, t1, 0x3FF
+    slli t1, t1, 21          # b10:1
     or t0, t0, t1
 
-    # b11 (bit 7)
     srli t1, t6, 11
     andi t1, t1, 1
-    slli t1, t1, 7
+    slli t1, t1, 20          # b11
     or t0, t0, t1
 
-    # opcode
-    addi t1, zero, 0x63
+    srli t1, t6, 12
+    andi t1, t1, 0xFF
+    slli t1, t1, 12          # b19:12
+    or t0, t0, t1
+
+    addi t1, zero, 0x6F
     or t0, t0, t1
     sw t0, 0(s3)
     addi s3, s3, 4

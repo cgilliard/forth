@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of the Forth compiler (6812 bytes, 1703 RV32I instructions).
+Binary-level formal verification of the Forth compiler (6804 bytes, 1701 RV32I instructions).
 
 Layers of verification (modeled after proofs/fam0.py):
 
@@ -345,7 +345,7 @@ def main():
     bin_path = os.path.join(BASE, 'bin', 'forth')
     with open(bin_path, 'rb') as f:
         binary = f.read()
-    BINARY_SIZE = 6812
+    BINARY_SIZE = 6804
     assert len(binary) == BINARY_SIZE, f"Expected {BINARY_SIZE} bytes, got {len(binary)}"
     words = [struct.unpack_from('<I', binary, i)[0] for i in range(0, len(binary), 4)]
     N = len(words)
