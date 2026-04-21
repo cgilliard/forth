@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+if [ -z "$1" ]; then
+    echo "Usage: tools/forth <input.forth> [output.bin]" >&2
+    exit 1
+fi
+
+INPUT="$1"
+OUTPUT="${2:-$(echo "$INPUT" | sed 's/\.[^.]*$//').bin}"
+
+(cat "$INPUT"; printf '\004') | qemu-system-riscv32 \
+    -machine virt -cpu "rv32,m=false,a=false,f=false,d=false,c=false,zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false" \
+    -nographic -bios none \
+    -device loader,file=bin/forth,addr=0x80000000 2>/dev/null > "$OUTPUT"
+
+echo "$OUTPUT"

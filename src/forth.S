@@ -1,5 +1,5 @@
 # Forth compiler for RV32I — reads Forth source from UART, outputs binary to UART.
-# Assembled by scripts/asm.py into src/forth.fam0 for bootstrapping via fam0.
+# Assembled by tools/asm.py into src/forth.fam0 for bootstrapping via fam0.
 #
 # Register allocation (compiler itself):
 #   s1  (x9)  = input buffer read pointer (current parse position)
