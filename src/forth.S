@@ -2130,7 +2130,7 @@ do_squote:
     addi t2, s3, 0
     # Copy chars until '"'
 sq_copy:
-    beq s1, s2, sq_done         # end of input (unterminated)
+    beq s1, s2, error_word      # unterminated string literal
     lbu t0, 0(s1)
     addi s1, s1, 1
     addi t1, zero, 34           # '"'
@@ -2261,7 +2261,7 @@ do_colon:
     # Skip whitespace to get the name
     j skip_ws_colon
 skip_ws_colon:
-    beq s1, s2, compile_done    # shouldn't happen but safety
+    beq s1, s2, error_word      # colon at EOF
     lbu t0, 0(s1)
     addi t1, zero, 32
     beq t0, t1, skip_colon_ws
@@ -2491,7 +2491,7 @@ num_loop:
     # Check if digit: '0' <= t0 <= '9'
     addi t0, t0, -48         # normalize '0' to 0
     addi t1, zero, 10
-    bgeu t0, t1, error_halt  # not a digit = error
+    bgeu t0, t1, error_word  # not a digit = error
 
     # accumulator = accumulator * 10 + digit
     # Multiply by 10 without MUL: t2 = t2*8 + t2*2 = (t2<<3) + (t2<<1)
@@ -2505,12 +2505,12 @@ num_loop:
 
 num_done:
     # If nothing was parsed (length=0, or only '-'), it's an error
-    beqz t3, error_halt
+    beqz t3, error_word
     addi t1, zero, 1
     beq t3, t1, check_neg_only  # if len=1, was it just '-'?
     j apply_neg
 check_neg_only:
-    bnez t4, error_halt      # if negative flag set and only 1 char, error
+    bnez t4, error_word      # if negative flag set and only 1 char, error
 apply_neg:
     beqz t4, emit_literal    # not negative
     sub t2, zero, t2         # negate
@@ -2581,8 +2581,41 @@ big_literal:
     j compile_loop
 
 # ============================================================================
-# Error: halt (infinite loop)
+# Error: print "? <word>\n" via UART, then halt
+# Expects: s5 = UART base, s6 = null-terminated word buffer
 # ============================================================================
+error_word:
+    addi t0, zero, 63          # '?'
+ew_w1:
+    lbu t1, 5(s5)
+    andi t1, t1, 32
+    beqz t1, ew_w1
+    sb t0, 0(s5)
+    addi t0, zero, 32          # ' '
+ew_w2:
+    lbu t1, 5(s5)
+    andi t1, t1, 32
+    beqz t1, ew_w2
+    sb t0, 0(s5)
+    addi t2, zero, 0           # index into word buffer
+ew_loop:
+    add t3, s6, t2
+    lbu t0, 0(t3)
+    beqz t0, ew_end
+ew_w3:
+    lbu t1, 5(s5)
+    andi t1, t1, 32
+    beqz t1, ew_w3
+    sb t0, 0(s5)
+    addi t2, t2, 1
+    j ew_loop
+ew_end:
+    addi t0, zero, 10          # '\n'
+ew_w4:
+    lbu t1, 5(s5)
+    andi t1, t1, 32
+    beqz t1, ew_w4
+    sb t0, 0(s5)
 error_halt:
     j error_halt
 
@@ -2590,12 +2623,23 @@ error_halt:
 # PHASE 3: Emit dispatch table and patch return jumps
 # ============================================================================
 compile_done:
+    # Check control stack balance: s9 should equal initial value 0x82800100
+    lui t0, 0x82800
+    addi t0, t0, 0x100
+    beq s9, t0, ctrl_ok
+    # Unmatched control structure — store "ctrl" in word buffer and error
+    addi t0, zero, 99         # 'c'
+    sb t0, 0(s6)
+    addi t0, zero, 116        # 't'
+    sb t0, 1(s6)
+    addi t0, zero, 114        # 'r'
+    sb t0, 2(s6)
+    addi t0, zero, 108        # 'l'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+ctrl_ok:
     # The dispatch table goes at the current output position
-    # dispatch: for each call site ID (0..s10-1):
-    #   li t0, N
-    #   beq s1, t0, call_site_N
-    #
-    # Final: j error (or infinite loop) for safety
     addi t2, s3, 0           # t2 = dispatch table start address
 
     # First, patch all jal-to-dispatch placeholders

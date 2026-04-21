@@ -47,7 +47,7 @@ B7 A2 62 00	# lui t0, 0x0062A
 23 A0 59 00	# sw t0, 0(s3)
 93 89 49 00	# addi s3, s3, 4
 63 94 24 01	# bne s1, s2, skip_ws_cont
-6F 10 D0 08	# j compile_done
+6F 10 10 0F	# j compile_done
 83 C2 04 00	# lbu t0, 0(s1)
 13 03 00 02	# addi t1, zero, 32
 63 80 62 02	# beq t0, t1, skip_char
@@ -1338,7 +1338,7 @@ B7 12 89 FF	# lui t0, 0xFF891
 93 8E 09 00	# addi t4, s3, 0
 93 89 49 00	# addi s3, s3, 4
 93 83 09 00	# addi t2, s3, 0
-63 80 24 03	# beq s1, s2, sq_done
+63 8E 24 45	# beq s1, s2, error_word
 83 C2 04 00	# lbu t0, 0(s1)
 93 84 14 00	# addi s1, s1, 1
 13 03 20 02	# addi t1, zero, 34
@@ -1418,7 +1418,7 @@ B3 E2 62 00	# or t0, t0, t1
 93 89 49 00	# addi s3, s3, 4
 6F E0 9F A9	# j compile_loop
 6F 00 40 00	# j skip_ws_colon
-63 80 24 33	# beq s1, s2, compile_done
+63 8E 24 31	# beq s1, s2, error_word
 83 C2 04 00	# lbu t0, 0(s1)
 13 03 00 02	# addi t1, zero, 32
 63 80 62 02	# beq t0, t1, skip_colon_ws
@@ -1563,18 +1563,18 @@ B3 8E 3F 41	# sub t4, t6, s3
 63 84 02 02	# beqz t0, num_done
 93 82 02 FD	# addi t0, t0, -48
 13 03 A0 00	# addi t1, zero, 10
-63 FC 62 0C	# bgeu t0, t1, error_halt
+63 FC 62 0C	# bgeu t0, t1, error_word
 13 9F 33 00	# slli t5, t2, 3
 93 9F 13 00	# slli t6, t2, 1
 B3 03 FF 01	# add t2, t5, t6
 B3 83 53 00	# add t2, t2, t0
 13 0E 1E 00	# addi t3, t3, 1
 6F F0 5F FD	# j num_loop
-63 0E 0E 0A	# beqz t3, error_halt
+63 0E 0E 0A	# beqz t3, error_word
 13 03 10 00	# addi t1, zero, 1
 63 04 6E 00	# beq t3, t1, check_neg_only
 6F 00 80 00	# j apply_neg
-63 96 0E 0A	# bnez t4, error_halt
+63 96 0E 0A	# bnez t4, error_word
 63 84 0E 00	# beqz t4, emit_literal
 B3 03 70 40	# sub t2, zero, t2
 B7 12 CA FF	# lui t0, 0xFFCA1
@@ -1617,7 +1617,45 @@ B3 E2 62 00	# or t0, t0, t1
 23 A0 59 00	# sw t0, 0(s3)
 93 89 49 00	# addi s3, s3, 4
 6F E0 8F F7	# j compile_loop
+93 02 F0 03	# addi t0, zero, 63
+03 C3 5A 00	# lbu t1, 5(s5)
+13 73 03 02	# andi t1, t1, 32
+E3 0C 03 FE	# beqz t1, ew_w1
+23 80 5A 00	# sb t0, 0(s5)
+93 02 00 02	# addi t0, zero, 32
+03 C3 5A 00	# lbu t1, 5(s5)
+13 73 03 02	# andi t1, t1, 32
+E3 0C 03 FE	# beqz t1, ew_w2
+23 80 5A 00	# sb t0, 0(s5)
+93 03 00 00	# addi t2, zero, 0
+33 0E 7B 00	# add t3, s6, t2
+83 42 0E 00	# lbu t0, 0(t3)
+63 8E 02 00	# beqz t0, ew_end
+03 C3 5A 00	# lbu t1, 5(s5)
+13 73 03 02	# andi t1, t1, 32
+E3 0C 03 FE	# beqz t1, ew_w3
+23 80 5A 00	# sb t0, 0(s5)
+93 83 13 00	# addi t2, t2, 1
+6F F0 1F FE	# j ew_loop
+93 02 A0 00	# addi t0, zero, 10
+03 C3 5A 00	# lbu t1, 5(s5)
+13 73 03 02	# andi t1, t1, 32
+E3 0C 03 FE	# beqz t1, ew_w4
+23 80 5A 00	# sb t0, 0(s5)
 6F 00 00 00	# j error_halt
+B7 02 80 82	# lui t0, 0x82800
+93 82 02 10	# addi t0, t0, 0x100
+63 86 5C 02	# beq s9, t0, ctrl_ok
+93 02 30 06	# addi t0, zero, 99
+23 00 5B 00	# sb t0, 0(s6)
+93 02 40 07	# addi t0, zero, 116
+A3 00 5B 00	# sb t0, 1(s6)
+93 02 20 07	# addi t0, zero, 114
+23 01 5B 00	# sb t0, 2(s6)
+93 02 C0 06	# addi t0, zero, 108
+A3 01 5B 00	# sb t0, 3(s6)
+23 02 0B 00	# sb zero, 4(s6)
+6F F0 9F F6	# j error_word
 93 83 09 00	# addi t2, s3, 0
 37 0E 80 82	# lui t3, 0x82800
 13 0E 0E 50	# addi t3, t3, 0x500

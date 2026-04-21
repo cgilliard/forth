@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of the Forth compiler (6804 bytes, 1701 RV32I instructions).
+Binary-level formal verification of the Forth compiler (6956 bytes, 1739 RV32I instructions).
 
 Layers of verification (modeled after proofs/fam0.py):
 
@@ -345,7 +345,7 @@ def main():
     bin_path = os.path.join(BASE, 'bin', 'forth')
     with open(bin_path, 'rb') as f:
         binary = f.read()
-    BINARY_SIZE = 6804
+    BINARY_SIZE = 6956
     assert len(binary) == BINARY_SIZE, f"Expected {BINARY_SIZE} bytes, got {len(binary)}"
     words = [struct.unpack_from('<I', binary, i)[0] for i in range(0, len(binary), 4)]
     N = len(words)
@@ -443,6 +443,7 @@ def main():
         25: "control stack (s9)",
         27: "patch list (s11)",
         18: "input buffer (s2)",
+        22: "word buffer (s6)",
     }
     # Temporary registers used as computed addresses in specific sections:
     # t2(x7), t3(x28), t4(x29), t5(x30) used as pointers in dict/call-site/patch code
