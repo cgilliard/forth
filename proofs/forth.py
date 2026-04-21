@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of the Forth compiler (9732 bytes, 2433 RV32I instructions).
+Binary-level formal verification of the Forth compiler (10764 bytes, 2691 RV32I instructions).
 
 Layers of verification (modeled after proofs/fam0.py):
 
@@ -347,7 +347,7 @@ def main():
     bin_path = os.path.join(BASE, 'bin', 'forth')
     with open(bin_path, 'rb') as f:
         binary = f.read()
-    BINARY_SIZE = 9732
+    BINARY_SIZE = 10764
     assert len(binary) == BINARY_SIZE, f"Expected {BINARY_SIZE} bytes, got {len(binary)}"
     words = [struct.unpack_from('<I', binary, i)[0] for i in range(0, len(binary), 4)]
     N = len(words)
@@ -881,6 +881,39 @@ def main():
         "add x5, x5, x19 (+loop)":   0x013282B3,
         "lw x6, 0(x5) (allot load)":  0x0002A303,
         "add x19, x6, x19 (allot)":   0x013309B3,
+        "andi x7, x19, 1 (mul lsb)":  0x0019F393,
+        "beq x7, zero, +8 (mul skip)":0x00038463,
+        "add x6, x6, x5 (mul acc)":   0x00530333,
+        "slli x5, x5, 1 (mul shift)": 0x00129293,
+        "srli x19, x19, 1 (mul)":     0x0019D993,
+        "bne x19, zero, -20 (mul)":   0xFE0996E3,
+        "addi x19, x6, 0 (mul res)":  0x00030993,
+        "srai x31, x5, 31 (div sign)": 0x41F2DF93,
+        "srai x30, x19, 31 (div sign)":0x41F9DF13,
+        "xor x5, x5, x31 (div abs)":  0x01F2C2B3,
+        "sub x5, x5, x31 (div abs)":  0x41F282B3,
+        "xor x19, x19, x30 (div abs)":0x01E9C9B3,
+        "sub x19, x19, x30 (div abs)":0x41E989B3,
+        "xor x30, x31, x30 (div qsign)":0x01EFCF33,
+        "addi x29, zero, 0 (div)":    0x00000E93,
+        "addi x7, zero, 32 (div)":    0x02000393,
+        "slli x6, x6, 1 (div)":       0x00131313,
+        "srli x28, x5, 31 (div)":     0x01F2DE13,
+        "or x6, x6, x28 (div)":       0x01C36333,
+        "slli x29, x29, 1 (div)":     0x001E9E93,
+        "bltu x6, x19, +12 (div)":    0x01336663,
+        "sub x6, x6, x19 (div)":      0x41330333,
+        "addi x29, x29, 1 (div)":     0x001E8E93,
+        "addi x7, x7, -1 (div)":      0xFFF38393,
+        "bne x7, zero, -36 (div)":    0xFC039EE3,
+        "xor x29, x29, x30 (div qfix)":0x01EECEB3,
+        "sub x29, x29, x30 (div qfix)":0x41EE8EB3,
+        "addi x19, x29, 0 (div)":     0x000E8993,
+        "xor x6, x6, x31 (mod rfix)": 0x01F34333,
+        "sub x6, x6, x31 (mod rfix)": 0x41F30333,
+        "mul x19, x5, x19 (hw)":      0x033289B3,
+        "div x19, x5, x19 (hw)":      0x0332C9B3,
+        "rem x19, x5, x19 (hw)":      0x0332E9B3,
     }
 
     emitted_vals = set(emitted_instrs.values())
@@ -1078,6 +1111,18 @@ def main():
 
         ("allot",
          ": main here 4 allot here 4 - 7 swap ! here 4 - @ 48 + emit 10 emit ; main bye",
+         None),
+
+        ("software multiply",
+         "6 7 * 48 + emit 10 emit bye",
+         None),
+
+        ("software divide",
+         "42 6 / 48 + emit 10 emit bye",
+         None),
+
+        ("software mod",
+         "17 5 mod 48 + emit 10 emit bye",
          None),
     ]
 
@@ -1903,6 +1948,28 @@ def main():
         # --- allot ---
         ("allot basic",
          ": main here 8 allot here swap - drop ; main bye",
+         None, None),
+
+        # --- multiply, divide, mod (software) ---
+        ("software multiply",
+         "6 7 * drop bye",
+         None, None),
+        ("software divide",
+         "42 6 / drop bye",
+         None, None),
+        ("software mod",
+         "17 5 mod drop bye",
+         None, None),
+
+        # --- m-extension keyword ---
+        ("m-extension multiply",
+         "m-extension 6 7 * drop bye",
+         None, None),
+        ("m-extension divide",
+         "m-extension 42 6 / drop bye",
+         None, None),
+        ("m-extension mod",
+         "m-extension 17 5 mod drop bye",
          None, None),
     ]
 

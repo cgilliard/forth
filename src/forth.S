@@ -440,8 +440,13 @@ not_semicolon:
     j emit_i
 skip_emit_i:
     addi t1, zero, 106         # 'j'
-    bne t0, t1, not_len1
+    bne t0, t1, skip_emit_j
     j emit_j
+skip_emit_j:
+    addi t1, zero, 42          # '*'
+    beq t0, t1, emit_mul
+    addi t1, zero, 47          # '/'
+    beq t0, t1, emit_div
 not_len1:
 
     # Two-char words (length 2)
@@ -454,7 +459,8 @@ not_len1:
     addi t1, zero, 105         # 'i'
     bne t0, t1, not_if2
     addi t1, zero, 102         # 'f'
-    beq t3, t1, do_if
+    bne t3, t1, not_if2
+    j do_if
 not_if2:
     # "or" = 'o','r'
     addi t1, zero, 111         # 'o'
@@ -552,6 +558,14 @@ not_bye3:
     addi t1, zero, 116         # 't'
     beq t4, t1, emit_rot
 not_rot3:
+    # "mod" = 'm','o','d'
+    addi t1, zero, 109         # 'm'
+    bne t0, t1, not_mod3
+    addi t1, zero, 111         # 'o'
+    bne t3, t1, not_mod3
+    addi t1, zero, 100         # 'd'
+    beq t4, t1, emit_mod
+not_mod3:
     j not_len3
 not_len3:
 
@@ -601,7 +615,8 @@ not_over4:
     addi t1, zero, 101         # 'e'
     bne t4, t1, not_then4
     addi t1, zero, 110         # 'n'
-    beq t5, t1, do_then
+    bne t5, t1, not_then4
+    j do_then
 not_then4:
     # "else" = 'e','l','s','e'
     addi t1, zero, 101         # 'e'
@@ -611,7 +626,8 @@ not_then4:
     addi t1, zero, 115         # 's'
     bne t4, t1, not_else4
     addi t1, zero, 101         # 'e'
-    beq t5, t1, do_else
+    bne t5, t1, not_else4
+    j do_else
 not_else4:
     # "emit" = 'e','m','i','t'
     addi t1, zero, 101         # 'e'
@@ -641,7 +657,8 @@ not_here4:
     addi t1, zero, 105         # 'i'
     bne t4, t1, not_exit4
     addi t1, zero, 116         # 't'
-    beq t5, t1, do_exit
+    bne t5, t1, not_exit4
+    j do_exit
 not_exit4:
     # "loop" = 'l','o','o','p'
     addi t1, zero, 108         # 'l'
@@ -651,7 +668,8 @@ not_exit4:
     addi t1, zero, 111         # 'o'
     bne t4, t1, not_loop4
     addi t1, zero, 112         # 'p'
-    beq t5, t1, do_loop
+    bne t5, t1, not_loop4
+    j do_loop
 not_loop4:
     j not_len4
 not_len4:
@@ -708,7 +726,9 @@ check_begin:
     bne t3, t1, not_len5
     lbu t3, 4(s6)
     addi t1, zero, 110         # 'n'
-    beq t3, t1, do_begin
+    bne t3, t1, not_begin5
+    j do_begin
+not_begin5:
     j not_len5
 
 check_until:
@@ -723,7 +743,9 @@ check_until:
     bne t3, t1, not_len5
     lbu t3, 4(s6)
     addi t1, zero, 108         # 'l'
-    beq t3, t1, do_until
+    bne t3, t1, not_until5
+    j do_until
+not_until5:
     j not_len5
 
 check_while:
@@ -738,7 +760,9 @@ check_while:
     bne t3, t1, not_len5
     lbu t3, 4(s6)
     addi t1, zero, 101         # 'e'
-    beq t3, t1, do_while
+    bne t3, t1, not_while5
+    j do_while
+not_while5:
     j not_len5
 
 check_ploop:
@@ -846,7 +870,9 @@ check_repeat_rest:
     bne t3, t1, not_len6
     lbu t3, 5(s6)
     addi t1, zero, 116         # 't'
-    beq t3, t1, do_repeat
+    bne t3, t1, not_repeat6
+    j do_repeat
+not_repeat6:
     j not_len6
 
 check_invert:
@@ -885,6 +911,47 @@ check_negate:
     beq t3, t1, emit_negate
     j not_len6
 not_len6:
+
+    # Eleven-char words (length 11)
+    addi t1, zero, 11
+    bne s7, t1, not_len11
+    # "m-extension" = 'm','-','e','x','t','e','n','s','i','o','n'
+    lbu t0, 0(s6)
+    addi t1, zero, 109         # 'm'
+    bne t0, t1, not_len11
+    lbu t0, 1(s6)
+    addi t1, zero, 45          # '-'
+    bne t0, t1, not_len11
+    lbu t0, 2(s6)
+    addi t1, zero, 101         # 'e'
+    bne t0, t1, not_len11
+    lbu t0, 3(s6)
+    addi t1, zero, 120         # 'x'
+    bne t0, t1, not_len11
+    lbu t0, 4(s6)
+    addi t1, zero, 116         # 't'
+    bne t0, t1, not_len11
+    lbu t0, 5(s6)
+    addi t1, zero, 101         # 'e'
+    bne t0, t1, not_len11
+    lbu t0, 6(s6)
+    addi t1, zero, 110         # 'n'
+    bne t0, t1, not_len11
+    lbu t0, 7(s6)
+    addi t1, zero, 115         # 's'
+    bne t0, t1, not_len11
+    lbu t0, 8(s6)
+    addi t1, zero, 105         # 'i'
+    bne t0, t1, not_len11
+    lbu t0, 9(s6)
+    addi t1, zero, 111         # 'o'
+    bne t0, t1, not_len11
+    lbu t0, 10(s6)
+    addi t1, zero, 110         # 'n'
+    bne t0, t1, not_len11
+    addi s0, zero, 1
+    j compile_loop
+not_len11:
 
     # --- Dictionary lookup ---
     j dict_lookup
@@ -1524,6 +1591,277 @@ heap_allot_cont:
     # addi x20, x20, 4 (advance stack ptr): 0x004A0A13
     lui t0, 0x004A1
     addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- * (multiply: pop two, push product) ---
+# s0 = 0: emit software shift-and-add loop (8 instructions)
+# s0 = 1: emit hardware MUL (1 instruction)
+emit_mul:
+    addi a0, zero, 46
+    j emit_underflow_check
+pop_mul_cont:
+    # lw x5, 0(x20) (pop 2nd): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    bnez s0, emit_mul_hw
+    # Software multiply: x19 = x5 * x19
+    # addi x6, zero, 0: 0x00000313
+    lui t0, 0x00000
+    addi t0, t0, 0x313
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # andi x7, x19, 1: 0x0019F393
+    lui t0, 0x0019F
+    addi t0, t0, 0x393
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # beq x7, zero, +8: 0x00038463
+    lui t0, 0x00038
+    addi t0, t0, 0x463
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # add x6, x6, x5: 0x00530333
+    lui t0, 0x00530
+    addi t0, t0, 0x333
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # slli x5, x5, 1: 0x00129293
+    lui t0, 0x00129
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # srli x19, x19, 1: 0x0019D993
+    lui t0, 0x0019E
+    addi t0, t0, -0x66D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # bne x19, zero, -20: 0xFE0996E3
+    lui t0, 0xFE099
+    addi t0, t0, 0x6E3
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x19, x6, 0: 0x00030993
+    lui t0, 0x00031
+    addi t0, t0, -0x66D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+emit_mul_hw:
+    # mul x19, x5, x19: 0x033289B3
+    lui t0, 0x03329
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- / (divide: pop two, push quotient) ---
+# s0 = 0: emit software binary long division (14 instructions)
+# s0 = 1: emit hardware DIV (1 instruction)
+emit_div:
+    addi a0, zero, 47
+    j emit_underflow_check
+pop_div_cont:
+    # lw x5, 0(x20) (pop 2nd): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    bnez s0, emit_div_hw
+    j emit_soft_divmod_q
+emit_div_hw:
+    # div x19, x5, x19: 0x0332C9B3
+    lui t0, 0x0332D
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- mod (modulo: pop two, push remainder) ---
+# s0 = 0: emit software binary long division returning remainder (14 instructions)
+# s0 = 1: emit hardware REM (1 instruction)
+emit_mod:
+    addi a0, zero, 48
+    j emit_underflow_check
+pop_mod_cont:
+    # lw x5, 0(x20) (pop 2nd): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    bnez s0, emit_mod_hw
+    j emit_soft_divmod_r
+emit_mod_hw:
+    # rem x19, x5, x19: 0x0332E9B3
+    lui t0, 0x0332F
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- Shared software divmod loop (used by / and mod) ---
+# Binary long division: x5 = dividend, x19 = divisor
+# x6 = remainder, x29 = quotient, x7 = bit counter
+emit_soft_divmod_q:
+    addi a0, zero, 1           # flag: return quotient
+    j emit_soft_divmod
+emit_soft_divmod_r:
+    addi a0, zero, 0           # flag: return remainder
+emit_soft_divmod:
+    # --- Sign handling: make both operands positive, save signs ---
+    # srai x31, x5, 31 (dividend sign -> x31): 0x41F2DF93
+    lui t0, 0x41F2E
+    addi t0, t0, -0x6D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # srai x30, x19, 31 (divisor sign -> x30): 0x41F9DF13
+    lui t0, 0x41F9E
+    addi t0, t0, -0xED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # xor x5, x5, x31 (flip dividend): 0x01F2C2B3
+    lui t0, 0x01F2C
+    addi t0, t0, 0x2B3
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sub x5, x5, x31 (abs dividend): 0x41F282B3
+    lui t0, 0x41F28
+    addi t0, t0, 0x2B3
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # xor x19, x19, x30 (flip divisor): 0x01E9C9B3
+    lui t0, 0x01E9D
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sub x19, x19, x30 (abs divisor): 0x41E989B3
+    lui t0, 0x41E99
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # xor x30, x31, x30 (quotient sign = dividend ^ divisor): 0x01EFCF33
+    lui t0, 0x01EFD
+    addi t0, t0, -0xCD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # --- Unsigned division on absolute values ---
+    # addi x6, zero, 0 (remainder = 0): 0x00000313
+    lui t0, 0x00000
+    addi t0, t0, 0x313
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x29, zero, 0 (quotient = 0): 0x00000E93
+    lui t0, 0x00001
+    addi t0, t0, -0x16D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x7, zero, 32 (counter): 0x02000393
+    lui t0, 0x02000
+    addi t0, t0, 0x393
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # slli x6, x6, 1: 0x00131313
+    lui t0, 0x00131
+    addi t0, t0, 0x313
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # srli x28, x5, 31: 0x01F2DE13
+    lui t0, 0x01F2E
+    addi t0, t0, -0x1ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # or x6, x6, x28: 0x01C36333
+    lui t0, 0x01C36
+    addi t0, t0, 0x333
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # slli x5, x5, 1: 0x00129293
+    lui t0, 0x00129
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # slli x29, x29, 1: 0x001E9E93
+    lui t0, 0x001EA
+    addi t0, t0, -0x16D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # bltu x6, x19, +12: 0x01336663
+    lui t0, 0x01336
+    addi t0, t0, 0x663
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sub x6, x6, x19: 0x41330333
+    lui t0, 0x41330
+    addi t0, t0, 0x333
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x29, x29, 1: 0x001E8E93
+    lui t0, 0x001E9
+    addi t0, t0, -0x16D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x7, x7, -1: 0xFFF38393
+    lui t0, 0xFFF38
+    addi t0, t0, 0x393
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # bne x7, zero, -36: 0xFC039EE3
+    lui t0, 0xFC03A
+    addi t0, t0, -0x11D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # --- Apply sign to result ---
+    bnez a0, emit_divmod_quot
+    # Remainder: apply dividend sign (x31)
+    # xor x6, x6, x31: 0x01F34333
+    lui t0, 0x01F34
+    addi t0, t0, 0x333
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sub x6, x6, x31: 0x41F30333
+    lui t0, 0x41F30
+    addi t0, t0, 0x333
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x19, x6, 0 (TOS = remainder): 0x00030993
+    lui t0, 0x00031
+    addi t0, t0, -0x66D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+emit_divmod_quot:
+    # Quotient: apply quotient sign (x30)
+    # xor x29, x29, x30: 0x01EECEB3
+    lui t0, 0x01EED
+    addi t0, t0, -0x14D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sub x29, x29, x30: 0x41EE8EB3
+    lui t0, 0x41EE9
+    addi t0, t0, -0x14D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x19, x29, 0 (TOS = quotient): 0x000E8993
+    lui t0, 0x000E9
+    addi t0, t0, -0x66D
     sw t0, 0(s3)
     addi s3, s3, 4
     j compile_loop
@@ -3237,7 +3575,13 @@ emit_rt_check:
     beqz a0, rtc43
     addi a0, a0, -1
     beqz a0, rtc44
-    j rtc45
+    addi a0, a0, -1
+    beqz a0, rtc45
+    addi a0, a0, -1
+    beqz a0, rtc46
+    addi a0, a0, -1
+    beqz a0, rtc47
+    j rtc48
 rtc0:
     j push_dup_cont
 rtc1:
@@ -3330,6 +3674,12 @@ rtc44:
     j pop_allot_cont
 rtc45:
     j heap_allot_cont
+rtc46:
+    j pop_mul_cont
+rtc47:
+    j pop_div_cont
+rtc48:
+    j pop_mod_cont
 
 # ============================================================================
 # Error handlers: write error name to word buffer, then fall through/jump to error_word
