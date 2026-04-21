@@ -661,6 +661,9 @@ not_len4:
     bne s7, t1, not_len5
     lbu t0, 0(s6)
 
+    # "allot" starts with 'a'
+    addi t1, zero, 97          # 'a'
+    beq t0, t1, check_allot
     # "begin" starts with 'b'
     addi t1, zero, 98          # 'b'
     beq t0, t1, check_begin
@@ -676,6 +679,21 @@ not_len4:
     # "leave" starts with 'l'
     addi t1, zero, 108         # 'l'
     beq t0, t1, check_leave
+    j not_len5
+
+check_allot:
+    lbu t3, 1(s6)
+    addi t1, zero, 108         # 'l'
+    bne t3, t1, not_len5
+    lbu t3, 2(s6)
+    addi t1, zero, 108         # 'l'
+    bne t3, t1, not_len5
+    lbu t3, 3(s6)
+    addi t1, zero, 111         # 'o'
+    bne t3, t1, not_len5
+    lbu t3, 4(s6)
+    addi t1, zero, 116         # 't'
+    beq t3, t1, emit_allot
     j not_len5
 
 check_begin:
@@ -1465,6 +1483,47 @@ heap_here_cont:
     # sw x19, 0(x5) (store aligned pointer back): 0x0132A023
     lui t0, 0x0132A
     addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- allot ( n -- ) : advance heap pointer by n bytes ---
+emit_allot:
+    addi a0, zero, 44
+    j emit_underflow_check
+pop_allot_cont:
+    # addi x5, x25, 0 (t0 = s9 = here addr): 0x000C8293
+    lui t0, 0x000C8
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # lw x6, 0(x5) (t1 = current heap ptr): 0x0002A303
+    lui t0, 0x0002A
+    addi t0, t0, 0x303
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # add x19, x6, x19 (TOS = new heap ptr): 0x013309B3
+    lui t0, 0x01331
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Heap bounds check (TOS < s6)
+    addi a0, zero, 45
+    j emit_heap_check
+heap_allot_cont:
+    # sw x19, 0(x5) (store new heap ptr): 0x0132A023
+    lui t0, 0x0132A
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # lw x19, 0(x20) (pop new TOS): 0x000A2983
+    lui t0, 0x000A3
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4 (advance stack ptr): 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
     sw t0, 0(s3)
     addi s3, s3, 4
     j compile_loop
@@ -3174,7 +3233,11 @@ emit_rt_check:
     beqz a0, rtc41
     addi a0, a0, -1
     beqz a0, rtc42
-    j rtc43
+    addi a0, a0, -1
+    beqz a0, rtc43
+    addi a0, a0, -1
+    beqz a0, rtc44
+    j rtc45
 rtc0:
     j push_dup_cont
 rtc1:
@@ -3263,6 +3326,10 @@ rtc42:
     j heap_store1_cont
 rtc43:
     j heap_store2_cont
+rtc44:
+    j pop_allot_cont
+rtc45:
+    j heap_allot_cont
 
 # ============================================================================
 # Error handlers: write error name to word buffer, then fall through/jump to error_word

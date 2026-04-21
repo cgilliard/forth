@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of the Forth compiler (9532 bytes, 2383 RV32I instructions).
+Binary-level formal verification of the Forth compiler (9732 bytes, 2433 RV32I instructions).
 
 Layers of verification (modeled after proofs/fam0.py):
 
@@ -347,7 +347,7 @@ def main():
     bin_path = os.path.join(BASE, 'bin', 'forth')
     with open(bin_path, 'rb') as f:
         binary = f.read()
-    BINARY_SIZE = 9532
+    BINARY_SIZE = 9732
     assert len(binary) == BINARY_SIZE, f"Expected {BINARY_SIZE} bytes, got {len(binary)}"
     words = [struct.unpack_from('<I', binary, i)[0] for i in range(0, len(binary), 4)]
     N = len(words)
@@ -879,6 +879,8 @@ def main():
         "lw x19, -8(x18) (i)":       0xFF892983,
         "lw x19, -16(x18) (j)":      0xFF092983,
         "add x5, x5, x19 (+loop)":   0x013282B3,
+        "lw x6, 0(x5) (allot load)":  0x0002A303,
+        "add x19, x6, x19 (allot)":   0x013309B3,
     }
 
     emitted_vals = set(emitted_instrs.values())
@@ -1072,6 +1074,10 @@ def main():
 
         ("do/loop",
          "5 0 do i drop loop bye",
+         None),
+
+        ("allot",
+         ": main here 4 allot here 4 - 7 swap ! here 4 - @ 48 + emit 10 emit ; main bye",
          None),
     ]
 
@@ -1893,6 +1899,11 @@ def main():
         ("error on line 12 with TX delay",
          "\n" * 11 + "badword",
          None, set(range(20))),
+
+        # --- allot ---
+        ("allot basic",
+         ": main here 8 allot here swap - drop ; main bye",
+         None, None),
     ]
 
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
