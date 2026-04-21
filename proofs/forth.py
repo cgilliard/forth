@@ -1322,6 +1322,37 @@ def main():
         # s" near-miss (length 2 starting with s but not ")
         ("2-char near-miss sx", "sx", None, None),
 
+        # 3-char: first char match, second char MISMATCH (exercises taken on 2nd-char bne)
+        ("3-char dup 2nd miss: dap", "dap", None, None),
+        ("3-char xor 2nd miss: xap", "xap", None, None),
+        ("3-char key 2nd miss: kap", "kap", None, None),
+        ("3-char bye 2nd miss: bap", "bap", None, None),
+        ("3-char rot 2nd miss: rap", "rap", None, None),
+        # 4-char: first char match, second char mismatch
+        ("4-char drop 2nd miss: dxop", "dxop", None, None),
+        ("4-char swap 2nd miss: sxap", "sxap", None, None),
+        ("4-char over 2nd miss: oxer", "oxer", None, None),
+        # 5-char +loop 2nd char miss (+ then not 'l')
+        ("5-char +loop 2nd miss: +xoop", "+xoop", None, None),
+
+        # Multiple leaves in same loop (exercises loop_patch_leaves iteration + then_repush)
+        ("multi-leave loop", "10 0 do i 3 = if leave then i 7 = if leave then i drop loop bye", None, None),
+        # Two leaves between one if/then (exercises then_repush loop iteration)
+        ("double-leave if/then", "10 0 do 1 if leave leave then i drop loop bye", None, None),
+        # Leave inside if/else (exercises else skip/repush leaves)
+        ("leave in if/else", "10 0 do i 3 = if leave else i drop then loop bye", None, None),
+        # Two leaves between if and else (exercises else_repush loop iteration)
+        ("double-leave if/else", "10 0 do 1 if leave leave else i drop then loop bye", None, None),
+        # Multiple leaves in +loop (exercises ploop_patch_leaves iteration)
+        ("multi-leave +loop", "20 0 do i 4 = if leave then i 12 = if leave then i drop 2 +loop bye", None, None),
+
+        # s" unterminated (exercises sq_copy end-of-input branch)
+        ("s\" unterminated", 's" hello', None, None),
+        # Colon at end of input (exercises skip_ws_colon eof)
+        ("colon eof", ":", None, None),
+        # Colon name runs to end of input (exercises rcn_loop eof)
+        ("colon name eof", ": foobar", None, None),
+
         # 3-char: match 1st+2nd but not 3rd (exercises 2nd-char-match, 3rd-char-miss)
         ("3-char dup miss 3rd: dua", "dua", None, None),
         ("3-char and miss 3rd: anx", "anc", None, None),
