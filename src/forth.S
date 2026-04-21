@@ -254,8 +254,12 @@ not_semicolon:
     addi t1, zero, 62          # '>'
     beq t0, t1, emit_gt
     addi t1, zero, 105         # 'i'
-    beq t0, t1, emit_i
-    j not_len1
+    bne t0, t1, skip_emit_i
+    j emit_i
+skip_emit_i:
+    addi t1, zero, 106         # 'j'
+    bne t0, t1, not_len1
+    j emit_j
 not_len1:
 
     # Two-char words (length 2)
@@ -300,6 +304,13 @@ not_ult2:
     addi t1, zero, 111         # 'o'
     beq t3, t1, do_do
 not_do2:
+    # 's"' = 's','"'
+    addi t1, zero, 115         # 's'
+    bne t0, t1, not_squote2
+    addi t1, zero, 34          # '"'
+    bne t3, t1, not_squote2
+    j do_squote
+not_squote2:
     j not_len2
 not_len2:
 
@@ -476,6 +487,12 @@ not_len4:
     # "while" starts with 'w'
     addi t1, zero, 119         # 'w'
     beq t0, t1, check_while
+    # "+loop" starts with '+'
+    addi t1, zero, 43          # '+'
+    beq t0, t1, check_ploop
+    # "leave" starts with 'l'
+    addi t1, zero, 108         # 'l'
+    beq t0, t1, check_leave
     j not_len5
 
 check_begin:
@@ -521,6 +538,36 @@ check_while:
     lbu t3, 4(s6)
     addi t1, zero, 101         # 'e'
     beq t3, t1, do_while
+    j not_len5
+
+check_ploop:
+    lbu t3, 1(s6)
+    addi t1, zero, 108         # 'l'
+    bne t3, t1, not_len5
+    lbu t3, 2(s6)
+    addi t1, zero, 111         # 'o'
+    bne t3, t1, not_len5
+    lbu t3, 3(s6)
+    addi t1, zero, 111         # 'o'
+    bne t3, t1, not_len5
+    lbu t3, 4(s6)
+    addi t1, zero, 112         # 'p'
+    beq t3, t1, do_ploop
+    j not_len5
+
+check_leave:
+    lbu t3, 1(s6)
+    addi t1, zero, 101         # 'e'
+    bne t3, t1, not_len5
+    lbu t3, 2(s6)
+    addi t1, zero, 97          # 'a'
+    bne t3, t1, not_len5
+    lbu t3, 3(s6)
+    addi t1, zero, 118         # 'v'
+    bne t3, t1, not_len5
+    lbu t3, 4(s6)
+    addi t1, zero, 101         # 'e'
+    beq t3, t1, do_leave
     j not_len5
 not_len5:
 
@@ -1353,9 +1400,34 @@ do_if:
 # --- THEN ---
 # Patch the forward branch from IF or ELSE to point here
 do_then:
-    # Pop control stack
+    # Pop control stack, skipping leave markers (odd = leave, even = if-addr)
+    lui t4, 0x82800
+    addi t4, t4, 0x900
+    addi t6, zero, 0
+then_skip_leaves:
     addi s9, s9, -4
-    lw t2, 0(s9)            # t2 = address of beq/jal to patch
+    lw t2, 0(s9)
+    andi t1, t2, 1
+    beqz t1, then_got_if
+    slli t1, t6, 2
+    add t1, t4, t1
+    sw t2, 0(t1)
+    addi t6, t6, 1
+    j then_skip_leaves
+then_got_if:
+    # Re-push leave markers back onto control stack
+    beqz t6, then_no_repush
+    addi t5, zero, 0
+then_repush:
+    slli t1, t5, 2
+    add t1, t4, t1
+    lw t0, 0(t1)
+    sw t0, 0(s9)
+    addi s9, s9, 4
+    addi t5, t5, 1
+    bne t5, t6, then_repush
+then_no_repush:
+    # t2 = address of beq/jal to patch
     # Compute offset: current output pos - patch address
     sub t3, s3, t2           # offset in bytes
     # Load the instruction at t2
@@ -1434,16 +1506,38 @@ patch_jal:
 # Emit unconditional jump forward (patch later by THEN)
 # Patch the IF's branch to jump here (just past the jal)
 do_else:
-    # Emit: jal zero, 0 (placeholder for jump over else-body)
-    addi t0, zero, 0x6F     # jal x0, 0 (just opcode, offset=0)
-    sw t0, 0(s3)
-    # Save current position (the jal) for THEN to patch
-    addi t6, s3, 0          # t6 = address of new jal
-    addi s3, s3, 4
-
-    # Pop control stack (IF's branch address)
+    # Pop control stack, skipping leave markers
+    lui t4, 0x82800
+    addi t4, t4, 0x900
+    addi t6, zero, 0
+else_skip_leaves:
     addi s9, s9, -4
     lw t2, 0(s9)
+    andi t1, t2, 1
+    beqz t1, else_got_if
+    slli t1, t6, 2
+    add t1, t4, t1
+    sw t2, 0(t1)
+    addi t6, t6, 1
+    j else_skip_leaves
+else_got_if:
+    # t2 = if-addr. Re-push leave markers.
+    beqz t6, else_no_repush
+    addi t5, zero, 0
+else_repush:
+    slli t1, t5, 2
+    add t1, t4, t1
+    lw t0, 0(t1)
+    sw t0, 0(s9)
+    addi s9, s9, 4
+    addi t5, t5, 1
+    bne t5, t6, else_repush
+else_no_repush:
+    # Emit: jal zero, 0 (placeholder for jump over else-body)
+    addi t0, zero, 0x6F
+    sw t0, 0(s3)
+    addi t6, s3, 0          # t6 = address of new jal
+    addi s3, s3, 4
 
     # Patch IF's branch to point here (current s3, after the jal)
     sub t3, s3, t2           # offset from IF's beq to here
@@ -1705,70 +1799,116 @@ do_do:
 
 # --- loop (counted loop end: increment index, branch if not done) ---
 do_loop:
-    # Emit: lw x5, -8(x18) — load index
-    # = 0xFF892283
+    # Pop control stack entries: skip leave markers (odd), find do-body addr (even)
+    # Save leave addresses temporarily in call site area (reusable scratch)
+    lui t4, 0x82800
+    addi t4, t4, 0x900          # scratch area for leave addrs
+    addi t6, zero, 0            # leave count
+loop_pop_cs:
+    addi s9, s9, -4
+    lw t2, 0(s9)
+    andi t1, t2, 1              # check if odd (leave marker)
+    beqz t1, loop_got_body      # even = do-body address
+    # It's a leave marker — store stripped address
+    andi t2, t2, -2             # clear bit 0
+    slli t1, t6, 2
+    add t1, t4, t1
+    sw t2, 0(t1)               # save leave jal address
+    addi t6, t6, 1
+    j loop_pop_cs
+loop_got_body:
+    # t2 = do-body start address, t6 = leave count, t4 = leave addr array
+    # Emit: lw x5, -8(x18) — load index = 0xFF892283
     lui t0, 0xFF892
     addi t0, t0, 0x283
     sw t0, 0(s3)
     addi s3, s3, 4
-    # Emit: addi x5, x5, 1 — increment
-    # = 0x00128293
+    # Emit: addi x5, x5, 1 — increment = 0x00128293
     lui t0, 0x00128
     addi t0, t0, 0x293
     sw t0, 0(s3)
     addi s3, s3, 4
-    # Emit: lw x6, -4(x18) — load limit
-    # = 0xFFC92303
+    # Emit: lw x6, -4(x18) — load limit = 0xFFC92303
     lui t0, 0xFFC92
     addi t0, t0, 0x303
     sw t0, 0(s3)
     addi s3, s3, 4
-    # Emit: beq x5, x6, +12 — skip to loop exit if done
-    # = 0x00628663
+    # Emit: beq x5, x6, +12 — skip to loop exit = 0x00628663
     lui t0, 0x00628
     addi t0, t0, 0x663
     sw t0, 0(s3)
     addi s3, s3, 4
-    # Emit: sw x5, -8(x18) — store updated index
-    # = 0xFE592C23
+    # Emit: sw x5, -8(x18) — store updated index = 0xFE592C23
     lui t0, 0xFE593
     addi t0, t0, -0x3DD
     sw t0, 0(s3)
     addi s3, s3, 4
     # Emit: jal x0, <back to loop body>
-    addi s9, s9, -4
-    lw t2, 0(s9)
     sub t3, t2, s3
     # Encode J-type
     srli t5, t3, 20
     andi t5, t5, 1
     slli t5, t5, 31
 
-    srli t6, t3, 1
-    andi t6, t6, 0x3FF
-    slli t6, t6, 21
-    or t5, t5, t6
+    srli t0, t3, 1
+    andi t0, t0, 0x3FF
+    slli t0, t0, 21
+    or t5, t5, t0
 
-    srli t6, t3, 11
-    andi t6, t6, 1
-    slli t6, t6, 20
-    or t5, t5, t6
+    srli t0, t3, 11
+    andi t0, t0, 1
+    slli t0, t0, 20
+    or t5, t5, t0
 
-    srli t6, t3, 12
-    andi t6, t6, 0xFF
-    slli t6, t6, 12
-    or t5, t5, t6
+    srli t0, t3, 12
+    andi t0, t0, 0xFF
+    slli t0, t0, 12
+    or t5, t5, t0
 
-    addi t6, zero, 0x6F
-    or t5, t5, t6
+    addi t0, zero, 0x6F
+    or t5, t5, t0
     sw t5, 0(s3)
     addi s3, s3, 4
-    # Emit: addi x18, x18, -8 — pop loop params
-    # = 0xFF890913
+    # Emit: addi x18, x18, -8 — pop loop params = 0xFF890913
     lui t0, 0xFF891
     addi t0, t0, -0x6ED
     sw t0, 0(s3)
     addi s3, s3, 4
+    # Now patch all leave jals to jump here (past the cleanup)
+    beqz t6, loop_no_leaves
+    addi t5, zero, 0           # leave index
+loop_patch_leaves:
+    slli t1, t5, 2
+    add t1, t4, t1
+    lw t2, 0(t1)               # leave jal address
+    sub t3, s3, t2             # offset = here - leave_addr
+    # Encode J-type: jal x0, t3
+    srli t0, t3, 20
+    andi t0, t0, 1
+    slli t0, t0, 31
+
+    srli t1, t3, 1
+    andi t1, t1, 0x3FF
+    slli t1, t1, 21
+    or t0, t0, t1
+
+    srli t1, t3, 11
+    andi t1, t1, 1
+    slli t1, t1, 20
+    or t0, t0, t1
+
+    srli t1, t3, 12
+    andi t1, t1, 0xFF
+    slli t1, t1, 12
+    or t0, t0, t1
+
+    addi t1, zero, 0x6F
+    or t0, t0, t1
+    sw t0, 0(t2)               # patch leave's jal
+
+    addi t5, t5, 1
+    bne t5, t6, loop_patch_leaves
+loop_no_leaves:
     j compile_loop
 
 # --- i (push loop index onto data stack) ---
@@ -1786,6 +1926,326 @@ emit_i:
     # Emit: lw x19, -8(x18) = 0xFF892983
     lui t0, 0xFF893
     addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- j (push outer loop index onto data stack) ---
+emit_j:
+    # Emit: addi x20, x20, -4 = 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: sw x19, 0(x20) = 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x19, -16(x18) = 0xFF092983
+    # I-type: imm=-16=0xFF0, rs1=18, funct3=010, rd=19
+    # = (0xFF0<<20)|(18<<15)|(2<<12)|(19<<7)|0x03 = 0xFF092983
+    lui t0, 0xFF093        # bit11 of 983=1, +1
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- +loop (variable-increment counted loop end) ---
+# TOS is the increment. Add to index, check if crossed limit boundary.
+# For positive increment: loop while index < limit
+# For negative increment: loop while index >= limit
+# Simplified: always use positive increment semantics (add TOS to index, compare)
+do_ploop:
+    # Pop control stack entries: skip leave markers (odd), find do-body addr (even)
+    lui t4, 0x82800
+    addi t4, t4, 0x900          # scratch area for leave addrs
+    addi t6, zero, 0            # leave count
+ploop_pop_cs:
+    addi s9, s9, -4
+    lw t2, 0(s9)
+    andi t1, t2, 1
+    beqz t1, ploop_got_body
+    andi t2, t2, -2             # clear bit 0
+    slli t1, t6, 2
+    add t1, t4, t1
+    sw t2, 0(t1)
+    addi t6, t6, 1
+    j ploop_pop_cs
+ploop_got_body:
+    # t2 = do-body start address, t6 = leave count, t4 = leave addr array
+    # Emit: lw x5, -8(x18) — load index = 0xFF892283
+    lui t0, 0xFF892
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: add x5, x5, x19 — add increment (TOS) to index = 0x013282B3
+    lui t0, 0x01328
+    addi t0, t0, 0x2B3
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x6, -4(x18) — load limit = 0xFFC92303
+    lui t0, 0xFFC92
+    addi t0, t0, 0x303
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x19, 0(x20) — pop new TOS (consume increment) = 0x000A2983
+    lui t0, 0x000A3
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi x20, x20, 4 = 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: beq x5, x6, +12 — if index==limit, exit loop = 0x00628663
+    lui t0, 0x00628
+    addi t0, t0, 0x663
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: sw x5, -8(x18) — store updated index = 0xFE592C23
+    lui t0, 0xFE593
+    addi t0, t0, -0x3DD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: jal x0, <back to loop body>
+    sub t3, t2, s3
+    srli t5, t3, 20
+    andi t5, t5, 1
+    slli t5, t5, 31
+
+    srli t0, t3, 1
+    andi t0, t0, 0x3FF
+    slli t0, t0, 21
+    or t5, t5, t0
+
+    srli t0, t3, 11
+    andi t0, t0, 1
+    slli t0, t0, 20
+    or t5, t5, t0
+
+    srli t0, t3, 12
+    andi t0, t0, 0xFF
+    slli t0, t0, 12
+    or t5, t5, t0
+
+    addi t0, zero, 0x6F
+    or t5, t5, t0
+    sw t5, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi x18, x18, -8 — pop loop params = 0xFF890913
+    lui t0, 0xFF891
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Patch leave jals to jump here (past cleanup)
+    beqz t6, ploop_no_leaves
+    addi t5, zero, 0
+ploop_patch_leaves:
+    slli t1, t5, 2
+    add t1, t4, t1
+    lw t2, 0(t1)
+    sub t3, s3, t2
+    srli t0, t3, 20
+    andi t0, t0, 1
+    slli t0, t0, 31
+
+    srli t1, t3, 1
+    andi t1, t1, 0x3FF
+    slli t1, t1, 21
+    or t0, t0, t1
+
+    srli t1, t3, 11
+    andi t1, t1, 1
+    slli t1, t1, 20
+    or t0, t0, t1
+
+    srli t1, t3, 12
+    andi t1, t1, 0xFF
+    slli t1, t1, 12
+    or t0, t0, t1
+
+    addi t1, zero, 0x6F
+    or t0, t0, t1
+    sw t0, 0(t2)
+
+    addi t5, t5, 1
+    bne t5, t6, ploop_patch_leaves
+ploop_no_leaves:
+    j compile_loop
+
+# --- leave (early exit from do/loop) ---
+# Emit: cleanup loop params + forward jump (patched by loop/+loop)
+# We emit the cleanup (addi x18, x18, -8) then a forward jal placeholder.
+# The jal gets pushed onto control stack; loop/+loop patches it when it
+# processes the loop end. To make this work, we use a second control stack
+# entry that loop recognizes.
+# Simplified approach: leave emits jal x0, 0 placeholder and pushes its
+# address onto a separate "leave list" that loop patches. But we only have
+# one control stack. Instead, we'll push a sentinel: leave pushes the jal
+# address, then loop patches all leave jals after emitting its own code.
+#
+# Simplest: leave emits addi x18, x18, -8 + jal x0, 0, pushes jal addr
+# onto control stack. But this conflicts with the do address already there.
+#
+# Better: leave puts its patch address in the patch list (s11) just like
+# semicolon's dispatch jumps. But those get patched to dispatch, not to
+# loop-exit. We need a different mechanism.
+#
+# Practical approach: leave emits the forward jal and stores its address
+# in the control stack ABOVE the do-body address. loop will pop past any
+# leave entries until it finds the do-body address. We mark leave entries
+# by storing them as (addr | 1) — odd values are leave patches, even values
+# are loop targets.
+do_leave:
+    # Emit: addi x18, x18, -8 — pop loop params from shadow stack
+    # = 0xFF890913
+    lui t0, 0xFF891
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: jal x0, 0 — forward jump placeholder (patched by loop)
+    addi t0, zero, 0x6F
+    sw t0, 0(s3)
+    # Push (address | 1) onto control stack to mark as leave
+    ori t0, s3, 1
+    sw t0, 0(s9)
+    addi s9, s9, 4
+    addi s3, s3, 4
+    j compile_loop
+
+# --- s" (string literal) ---
+# Parse characters until closing ", embed in code with skip-over jump.
+# At runtime: pushes (addr, len) onto data stack.
+do_squote:
+    # Skip one whitespace char after s"
+    addi s1, s1, 1
+    # Emit: jal x0, 0 — skip over string data (patched later)
+    addi t0, zero, 0x6F
+    sw t0, 0(s3)
+    addi t4, s3, 0              # t4 = address of skip jal (for patching)
+    addi s3, s3, 4
+    # t2 = string start address in output
+    addi t2, s3, 0
+    # Copy chars until '"'
+sq_copy:
+    beq s1, s2, sq_done         # end of input (unterminated)
+    lbu t0, 0(s1)
+    addi s1, s1, 1
+    addi t1, zero, 34           # '"'
+    beq t0, t1, sq_done
+    sb t0, 0(s3)
+    addi s3, s3, 1
+    j sq_copy
+sq_done:
+    # t3 = string length
+    sub t3, s3, t2
+    # Pad output to 4-byte alignment
+sq_align:
+    andi t0, s3, 3
+    beqz t0, sq_aligned
+    sb zero, 0(s3)
+    addi s3, s3, 1
+    j sq_align
+sq_aligned:
+    # Patch the skip jal to jump here
+    sub t5, s3, t4              # offset = current - jal_addr
+    # Encode J-type: jal x0, t5
+    srli t0, t5, 20
+    andi t0, t0, 1
+    slli t0, t0, 31
+
+    srli t6, t5, 1
+    andi t6, t6, 0x3FF
+    slli t6, t6, 21
+    or t0, t0, t6
+
+    srli t6, t5, 11
+    andi t6, t6, 1
+    slli t6, t6, 20
+    or t0, t0, t6
+
+    srli t6, t5, 12
+    andi t6, t6, 0xFF
+    slli t6, t6, 12
+    or t0, t0, t6
+
+    addi t6, zero, 0x6F
+    or t0, t0, t6
+    sw t0, 0(t4)                # patch skip jal
+
+    # Emit code to push (addr, len) onto data stack
+    # Push current TOS, then load addr, then push addr, load len
+    # addi x20, x20, -4 (make room): 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw x19, 0(x20) (save old TOS): 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, -4 (make room for addr): 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Compute the runtime address of the string.
+    # At runtime, the string data is at a fixed offset from the start of the binary.
+    # We need to emit instructions that load the absolute address of the string.
+    # String is at output offset (t2 - output_base). The runtime load address is 0x80000000.
+    # So runtime string addr = 0x80000000 + (t2 - s8) where s8 = output base.
+    # We emit: lui x19, upper; addi x19, x19, lower
+    # But the address is only known at compile time, so we compute and embed it.
+    sub t5, t2, s8              # offset from output base
+    lui t6, 0x80000             # runtime base
+    add t5, t5, t6              # runtime string address
+
+    # Emit: load string address into x19
+    # Split t5 into upper20 + lower12
+    slli t6, t5, 20
+    srli t6, t6, 20             # t6 = t5 & 0xFFF (lower 12)
+    srli t0, t5, 12             # upper 20
+    # Check sign extension compensation
+    srli t1, t6, 11
+    andi t1, t1, 1
+    add t0, t0, t1              # adjust upper if bit11 of lower is set
+
+    # Emit: lui x19, upper
+    slli t0, t0, 12
+    addi t1, zero, 19
+    slli t1, t1, 7
+    ori t1, t1, 0x37
+    or t0, t0, t1
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Emit: addi x19, x19, lower12
+    slli t0, t6, 20
+    lui t1, 0x99
+    addi t1, t1, -0x66D         # 0x98993
+    or t0, t0, t1
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # sw x19, 0(x20) — store string address: 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Now load length into TOS
+    # t3 still has string length. Emit: addi x19, x0, t3
+    # This assumes length fits in 12-bit signed (max 2047). Strings > 2047 bytes
+    # would need lui+addi but that's an unrealistic case for embedded.
+    slli t0, t3, 20
+    addi t1, zero, 19
+    slli t1, t1, 7
+    ori t1, t1, 0x13
+    or t0, t0, t1
     sw t0, 0(s3)
     addi s3, s3, 4
     j compile_loop

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of the Forth compiler (5556 bytes, 1389 RV32I instructions).
+Binary-level formal verification of the Forth compiler (6812 bytes, 1703 RV32I instructions).
 
 Layers of verification (modeled after proofs/fam0.py):
 
@@ -345,7 +345,7 @@ def main():
     bin_path = os.path.join(BASE, 'bin', 'forth')
     with open(bin_path, 'rb') as f:
         binary = f.read()
-    BINARY_SIZE = 5556
+    BINARY_SIZE = 6812
     assert len(binary) == BINARY_SIZE, f"Expected {BINARY_SIZE} bytes, got {len(binary)}"
     words = [struct.unpack_from('<I', binary, i)[0] for i in range(0, len(binary), 4)]
     N = len(words)
@@ -453,7 +453,7 @@ def main():
         # or is a temporary register used in known code sections
         known_safe = rs1 in safe_bases
         # Temps used as computed pointers in dict lookup and dispatch table code
-        temp_as_ptr = rs1 in (7, 28, 29, 30)  # t2, t3, t4, t5
+        temp_as_ptr = rs1 in (6, 7, 28, 29, 30)  # t1, t2, t3, t4, t5
         if not known_safe and not temp_as_ptr:
             print(f"  WARN  store @0x{pc:03x}: {width} {RNAMES[rs2]}, {imm}({RNAMES[rs1]}) — unexpected base")
             store_ok = False
@@ -527,6 +527,11 @@ def main():
         "1 2 3 rot drop drop drop bye",
         "1 2 swap drop drop bye",
         "1 2 over drop drop drop bye",
+        "2 0 do 2 0 do j drop loop loop bye",
+        "10 0 do i drop 2 +loop bye",
+        "10 0 do leave loop bye",
+        "10 0 do i 3 = if leave then i drop loop bye",
+        's" Hi" drop drop bye',
         "1 @ drop bye",
         "1 2 ! bye",
         "1 c@ drop bye",
@@ -748,6 +753,8 @@ def main():
         "sw x5, -8(x18) (loop)":     0xFE592C23,
         "addi x18, x18, -8 (loop)":  0xFF890913,
         "lw x19, -8(x18) (i)":       0xFF892983,
+        "lw x19, -16(x18) (j)":      0xFF092983,
+        "add x5, x5, x19 (+loop)":   0x013282B3,
     }
 
     emitted_vals = set(emitted_instrs.values())
@@ -1051,6 +1058,12 @@ def main():
         "3 begin dup while 1 - repeat drop bye",
         "5 0 do i drop loop bye",
         "3 0 do 2 0 do i drop loop loop bye",
+        "2 0 do 2 0 do j drop loop loop bye",
+        "10 0 do i drop 2 +loop bye",
+        "10 0 do leave loop bye",
+        "10 0 do i 3 = if leave then i drop loop bye",
+        "20 0 do i 6 = if leave then i drop 2 +loop bye",
+        's" Hello" drop drop bye',
     ]
 
     jalr_found_anywhere = False
@@ -1282,6 +1295,32 @@ def main():
         ("4-char loop miss: looa", "looa", None, None),
         ("4-char loop miss: loxa", "loxa", None, None),
         ("4-char loop miss: lxop", "lxop", None, None),
+
+        # j (outer loop index)
+        ("j basic", "2 0 do 2 0 do j drop loop loop bye", None, None),
+        # j is length-1, covered by i/j trampoline dispatch
+
+        # +loop
+        ("+loop basic", "10 0 do i drop 2 +loop bye", None, None),
+        # +loop near-miss
+        ("5-char +looa", "+looa", None, None),
+        ("5-char +loxa", "+loxa", None, None),
+        ("5-char +lxop", "+lxop", None, None),
+
+        # leave
+        ("leave basic", "10 0 do leave loop bye", None, None),
+        ("leave in if", "10 0 do i 3 = if leave then i drop loop bye", None, None),
+        ("leave in +loop", "20 0 do i 6 = if leave then i drop 2 +loop bye", None, None),
+        # leave near-miss
+        ("5-char leavx", "leavx", None, None),
+        ("5-char leaxe", "leaxe", None, None),
+        ("5-char lexve", "lexve", None, None),
+        ("5-char lxave", "lxave", None, None),
+
+        # s" (string literal)
+        ("s\" basic", 's" Hi" drop drop bye', None, None),
+        # s" near-miss (length 2 starting with s but not ")
+        ("2-char near-miss sx", "sx", None, None),
 
         # 3-char: match 1st+2nd but not 3rd (exercises 2nd-char-match, 3rd-char-miss)
         ("3-char dup miss 3rd: dua", "dua", None, None),
