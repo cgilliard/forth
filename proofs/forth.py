@@ -1971,6 +1971,42 @@ def main():
         ("m-extension mod",
          "m-extension 17 5 mod drop bye",
          None, None),
+
+        # --- Keyword dispatch partial matches (exercises mismatch branches) ---
+        # 3-char 'mod': second char mismatch (0x53c)
+        ("3-char partial: max", "max", None, None),
+        # 3-char 'mod': third char mismatch (0x544)
+        ("3-char partial: moo", "moo", None, None),
+        # 5-char 'allot': char 1 mismatch (0x6e0)
+        ("5-char partial: abcde", "abcde", None, None),
+        # 5-char 'allot': char 2 mismatch (0x6ec)
+        ("5-char partial: alcde", "alcde", None, None),
+        # 5-char 'allot': char 3 mismatch (0x6f8)
+        ("5-char partial: allde", "allde", None, None),
+        # 5-char 'allot': char 4 mismatch (0x704)
+        ("5-char partial: alloe", "alloe", None, None),
+        # 11-char 'm-extension': char 0 mismatch (0x9a4)
+        ("11-char partial: pos0", "X-extension", None, None),
+        # 11-char 'm-extension': char 1 mismatch (0x9b0)
+        ("11-char partial: pos1", "mXextension", None, None),
+        # 11-char 'm-extension': char 2 mismatch (0x9bc)
+        ("11-char partial: pos2", "m-Xxtension", None, None),
+        # 11-char 'm-extension': char 3 mismatch (0x9c8)
+        ("11-char partial: pos3", "m-eXtension", None, None),
+        # 11-char 'm-extension': char 4 mismatch (0x9d4)
+        ("11-char partial: pos4", "m-exXension", None, None),
+        # 11-char 'm-extension': char 5 mismatch (0x9e0)
+        ("11-char partial: pos5", "m-extXnsion", None, None),
+        # 11-char 'm-extension': char 6 mismatch (0x9ec)
+        ("11-char partial: pos6", "m-exteXsion", None, None),
+        # 11-char 'm-extension': char 7 mismatch (0x9f8)
+        ("11-char partial: pos7", "m-extenXion", None, None),
+        # 11-char 'm-extension': char 8 mismatch (0xa04)
+        ("11-char partial: pos8", "m-extensXon", None, None),
+        # 11-char 'm-extension': char 9 mismatch (0xa10)
+        ("11-char partial: pos9", "m-extensiXn", None, None),
+        # 11-char 'm-extension': char 10 mismatch (0xa1c)
+        ("11-char partial: pos10", "m-extensioX", None, None),
     ]
 
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
