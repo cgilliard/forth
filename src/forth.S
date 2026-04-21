@@ -81,6 +81,11 @@ read_done:
     # lui s2, 0x85800       (shadow stack base)
     # We also need to initialize s3 (TOS) but it gets set on first push
 
+    # Emit: nop (0x00000013) — magic bytes for tooling
+    addi t0, zero, 0x13
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
     # Emit: lui s5, 0x10000 (= 0x10000AB7)
     lui t0, 0x10001         # upper bits: 0x10001000 (adjusted for addi sign ext)
     addi t0, t0, -0x549     # 0x10001000 + (-0x549) = 0x10000AB7
