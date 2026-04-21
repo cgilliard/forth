@@ -14,4 +14,10 @@ OUTPUT="${2:-$(echo "$INPUT" | sed 's/\.[^.]*$//').bin}"
     -nographic -bios none \
     -device loader,file=bin/forth,addr=0x80000000 2>/dev/null > "$OUTPUT"
 
+if head -c 2 "$OUTPUT" | grep -q '^? '; then
+    cat "$OUTPUT" >&2
+    rm -f "$OUTPUT"
+    exit 1
+fi
+
 echo "$OUTPUT"

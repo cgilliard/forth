@@ -13,6 +13,8 @@
 #   s9  (x25) = compile-time control stack pointer
 #   s10 (x26) = dispatch ID counter (next call site ID to assign)
 #   s11 (x27) = patch list pointer (records locations of jal-to-dispatch)
+#   gp  (x3)  = line number counter (starts at 1)
+#   tp  (x4)  = inside-definition flag (0=outside, 1=inside : ... ;)
 #   t0-t6     = temporaries
 #
 # Compiled program register convention:
@@ -21,25 +23,32 @@
 #   s3  (x19) = TOS (top of data stack, cached in register)
 #   s4  (x20) = data stack pointer (rest of stack)
 #   s5  (x21) = UART base (0x10000000)
+#   s6  (x22) = data stack lower limit (here+64MB, overflow check)
+#   s7  (x23) = data stack upper limit (here+72MB, underflow check)
+#   s8  (x24) = shadow stack upper limit (here+73MB, overflow check)
+#   s9  (x25) = store protection boundary (here, code/heap boundary)
+#   s10 (x26) = shadow stack base (here+72MB, underflow check)
 #   t0-t6     = temporaries used by primitives
+#   ra  (x1)  = [compiler only] error handler output address for runtime checks
 #
-# Memory map:
+# Memory map (compiler):
 #   0x80000000           = load address (this compiler, or compiled program)
 #   0x82000000           = dictionary (36 bytes per entry: 32 name + 4 addr)
 #   0x82800000           = word parse buffer (256 bytes)
-#   0x82800100           = control flow stack (compile-time, 1024 bytes)
-#   0x82800500           = patch list (addresses needing dispatch fixup)
-#   0x82800900           = call site list (target addresses for dispatch table)
-#   0x82800F00           = leave scratch (temporary storage during loop/if compilation)
+#   0x82800100           = control flow stack (compile-time, 4096 bytes)
+#   0x82801100           = leave scratch (temporary storage during loop/if compilation)
+#   0x82810000           = patch list (addresses needing dispatch fixup, 256KB)
+#   0x82850000           = call site list (target addresses for dispatch table, 256KB)
 #   0x83000000           = input buffer (source code)
 #   0x84000000           = output buffer (compiled binary)
 #
-# Compiled program memory map:
-#   0x80000000           = code (grows up, ~1MB reserved)
-#   0x80100000           = heap pointer variable (4 bytes)
-#   0x80100004           = heap start (64 MB, grows up)
-#   0x84100000           = data stack top (8 MB, grows down)
-#   0x84900000           = shadow stack base (grows up)
+# Compiled program memory map (position-independent, all relative to here):
+#   load_addr            = code start
+#   here (end of binary) = heap pointer variable (4 bytes), then heap (64MB)
+#   here + 64MB          = data stack lower limit (overflow guard)
+#   here + 72MB          = data stack top / shadow stack base
+#   here + 73MB          = shadow stack upper limit (overflow guard)
+#   Computed at bye via auipc. Data stack: 8MB down. Shadow: 1MB up.
 
 # ============================================================================
 # PHASE 1: Read all input from UART into input buffer
@@ -77,55 +86,208 @@ read_done:
     # s9 = control stack pointer
     addi s9, t0, 256        # 0x82800100
     # s11 = patch list pointer
-    addi s11, t0, 0x500     # 0x82800500
+    lui s11, 0x82810         # 0x82810000
     # s10 = dispatch ID counter (starts at 0)
     addi s10, zero, 0
+    # gp = line number counter (starts at 1)
+    addi gp, zero, 1
+    # tp = inside-definition flag (0 = not inside a colon definition)
+    addi tp, zero, 0
 
-    # Emit prologue for compiled program:
-    # lui s5, 0x10000       (UART base)
-    # lui s4, 0x85000       (data stack base)
-    # lui s2, 0x85800       (shadow stack base)
-    # We also need to initialize s3 (TOS) but it gets set on first push
+    # Emit PIC prologue for compiled program (17 words, patched at bye):
+    # word 0: nop (magic)
+    # word 1: lui s5, 0x10000 (UART, absolute hw addr)
+    # word 2: auipc t0, <upper20>  (placeholder, patched at bye)
+    # word 3: addi  t0, t0, <lower12> (placeholder, patched at bye)
+    #   → t0 = here = end of binary (heap pointer variable lives here)
+    # word 4: addi s9, t0, 0       (s9 = here, store protection lower bound)
+    # word 5: lui t1, 0x04000      (64MB)
+    # word 6: add s6, t0, t1       (s6 = here+64MB, stack lower limit)
+    # word 7: lui t1, 0x04800      (72MB)
+    # word 8: add s4, t0, t1       (s4 = here+72MB, data stack top)
+    # word 9: addi s2, s4, 0       (s2 = here+72MB, shadow stack base)
+    # word 10: addi s7, s4, 0      (s7 = here+72MB, stack underflow limit)
+    # word 11: addi s10, s4, 0     (s10 = here+72MB, shadow underflow limit)
+    # word 12: lui t1, 0x04900     (73MB)
+    # word 13: add s8, t0, t1      (s8 = here+73MB, shadow upper limit)
+    # word 14: addi t1, t0, 4      (t1 = here+4, heap start)
+    # word 15: sw t1, 0(t0)        (mem[here] = here+4, init heap pointer)
+    # word 16: jal x0, +64         (skip 15-instruction error handler)
 
-    # Emit: nop (0x00000013) — magic bytes for tooling
+    # word 0: nop = 0x00000013
     addi t0, zero, 0x13
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # Emit: lui s5, 0x10000 (= 0x10000AB7)
-    lui t0, 0x10001         # upper bits: 0x10001000 (adjusted for addi sign ext)
-    addi t0, t0, -0x549     # 0x10001000 + (-0x549) = 0x10000AB7
+    # word 1: lui s5, 0x10000 = 0x10000AB7
+    lui t0, 0x10001
+    addi t0, t0, -0x549
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # emit: lui s4, 0x84100 (data stack top)
-    # = 0x84100A37
-    lui t0, 0x84101         # 0x84101000 (adjust for negative addi)
-    addi t0, t0, -0x5C9     # 0x84101000 - 0x5C9 = 0x84100A37
+    # word 2: auipc x5, 0 (placeholder) = 0x00000297
+    addi t0, zero, 0x297
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # emit: lui s2, 0x84900 (shadow stack base)
-    # = 0x84900937
-    lui t0, 0x84901         # 0x84901000
-    addi t0, t0, -0x6C9     # 0x84901000 - 0x6C9 = 0x84900937
+    # word 3: addi x5, x5, 0 (placeholder) = 0x00028293
+    lui t0, 0x00028
+    addi t0, t0, 0x293
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # emit: heap pointer initialization
-    # lui x5, 0x80100       (t0 = 0x80100000) = 0x801002B7
-    lui t0, 0x80100
-    addi t0, t0, 0x2B7
+    # word 4: addi s9, t0, 0 (s9 = here) = 0x00028C93
+    lui t0, 0x00029
+    addi t0, t0, -0x36D
     sw t0, 0(s3)
     addi s3, s3, 4
-    # addi x6, x5, 4        (t1 = 0x80100004) = 0x00428313
+
+    # word 5: lui t1, 0x04000 (64MB) = 0x04000337
+    lui t0, 0x04000
+    addi t0, t0, 0x337
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 6: add s6, t0, t1 (s6 = here+64MB) = 0x00628B33
+    lui t0, 0x00629
+    addi t0, t0, -0x4CD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 7: lui t1, 0x04800 (72MB) = 0x04800337
+    lui t0, 0x04800
+    addi t0, t0, 0x337
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 8: add s4, t0, t1 (s4 = here+72MB) = 0x00628A33
+    lui t0, 0x00629
+    addi t0, t0, -0x5CD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 9: addi s2, s4, 0 (s2 = s4) = 0x000A0913
+    lui t0, 0x000A1
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 10: addi s7, s4, 0 (s7 = s4) = 0x000A0B93
+    lui t0, 0x000A1
+    addi t0, t0, -0x46D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 11: addi s10, s4, 0 (s10 = s4) = 0x000A0D13
+    lui t0, 0x000A1
+    addi t0, t0, -0x2ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 12: lui t1, 0x04900 (73MB) = 0x04900337
+    lui t0, 0x04900
+    addi t0, t0, 0x337
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 13: add s8, t0, t1 (s8 = here+73MB) = 0x00628C33
+    lui t0, 0x00629
+    addi t0, t0, -0x3CD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 14: addi t1, t0, 4 (t1 = here+4) = 0x00428313
     lui t0, 0x00428
     addi t0, t0, 0x313
     sw t0, 0(s3)
     addi s3, s3, 4
-    # sw x6, 0(x5)          (mem[0x80100000] = 0x80100004) = 0x0062A023
+
+    # word 15: sw t1, 0(t0) (init heap ptr) = 0x0062A023
     lui t0, 0x0062A
     addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 16: jal x0, +64 (skip 15-instruction error handler) = 0x0400006F
+    lui t0, 0x04000
+    addi t0, t0, 0x06F
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Save error handler output address for runtime check emission
+    addi ra, s3, 0
+    # --- Runtime error handler: prints "!\n" then halts via QEMU FINISHER ---
+    # 1. addi t0, zero, 0x21 = 0x02100293
+    lui t0, 0x02100
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 2. lbu t1, 5(s5) = 0x005AC303
+    lui t0, 0x005AC
+    addi t0, t0, 0x303
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 3. andi t1, t1, 0x20 = 0x02037313
+    lui t0, 0x02037
+    addi t0, t0, 0x313
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 4. beq t1, zero, -8 = 0xFE030CE3
+    lui t0, 0xFE031
+    addi t0, t0, -0x31D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 5. sb t0, 0(s5) = 0x005A8023
+    lui t0, 0x005A8
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 6. addi t0, zero, 0x0A = 0x00A00293
+    lui t0, 0x00A00
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 7. lbu t1, 5(s5) = 0x005AC303
+    lui t0, 0x005AC
+    addi t0, t0, 0x303
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 8. andi t1, t1, 0x20 = 0x02037313
+    lui t0, 0x02037
+    addi t0, t0, 0x313
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 9. beq t1, zero, -8 = 0xFE030CE3
+    lui t0, 0xFE031
+    addi t0, t0, -0x31D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 10. sb t0, 0(s5) = 0x005A8023
+    lui t0, 0x005A8
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 11. lui t0, 0x100 = 0x001002B7
+    lui t0, 0x00100
+    addi t0, t0, 0x2B7
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 12. lui t1, 5 = 0x00005337
+    lui t0, 0x00005
+    addi t0, t0, 0x337
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 13. addi t1, t1, 0x555 = 0x55530313
+    lui t0, 0x55530
+    addi t0, t0, 0x313
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 14. sw t1, 0(t0) = 0x0062A023
+    lui t0, 0x0062A
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # 15. jal x0, 0 (halt loop) = 0x0000006F
+    addi t0, zero, 0x6F
     sw t0, 0(s3)
     addi s3, s3, 4
 
@@ -133,6 +295,11 @@ read_done:
 # PHASE 2b: Main compile loop
 # ============================================================================
 compile_loop:
+    # Check output buffer overflow (s3 must be < 0x84100000)
+    lui t0, 0x84100
+    bltu s3, t0, output_ok
+    j error_output_overflow
+output_ok:
     # Skip whitespace
 skip_ws:
     bne s1, s2, skip_ws_cont    # continue if input remains
@@ -150,6 +317,10 @@ skip_ws_cont:
     j parse_word                # non-whitespace found
 
 skip_char:
+    addi t1, zero, 10
+    bne t0, t1, skip_char_noline
+    addi gp, gp, 1
+skip_char_noline:
     addi s1, s1, 1
     j skip_ws
 
@@ -167,6 +338,11 @@ pw_loop:
     beq t0, t1, pw_done
     addi t1, zero, 9            # tab
     beq t0, t1, pw_done
+    # check word length limit (31 chars + null = 32 byte dict name field)
+    addi t1, zero, 31
+    bltu s7, t1, pw_store
+    j error_name_overflow
+pw_store:
     # store char in word buffer
     add t2, s6, s7              # word_buf[len]
     sb t0, 0(t2)
@@ -195,6 +371,7 @@ skip_line:
     addi s1, s1, 1
     addi t1, zero, 10
     bne t0, t1, skip_line
+    addi gp, gp, 1
     j compile_loop
 not_backslash:
 
@@ -209,6 +386,10 @@ skip_paren:
     beq s1, s2, compile_loop
     lbu t0, 0(s1)
     addi s1, s1, 1
+    addi t1, zero, 10
+    bne t0, t1, skip_paren_nonl
+    addi gp, gp, 1
+skip_paren_nonl:
     addi t1, zero, 41           # ')'
     bne t0, t1, skip_paren
     j compile_loop
@@ -303,7 +484,8 @@ not_ult2:
     addi t1, zero, 100         # 'd'
     bne t0, t1, not_do2
     addi t1, zero, 111         # 'o'
-    beq t3, t1, do_do
+    bne t3, t1, not_do2
+    j do_do
 not_do2:
     # 's"' = 's','"'
     addi t1, zero, 115         # 's'
@@ -553,8 +735,8 @@ check_ploop:
     bne t3, t1, not_len5
     lbu t3, 4(s6)
     addi t1, zero, 112         # 'p'
-    beq t3, t1, do_ploop
-    j not_len5
+    bne t3, t1, not_len5
+    j do_ploop
 
 check_leave:
     lbu t3, 1(s6)
@@ -568,7 +750,9 @@ check_leave:
     bne t3, t1, not_len5
     lbu t3, 4(s6)
     addi t1, zero, 101         # 'e'
-    beq t3, t1, do_leave
+    bne t3, t1, not_leave
+    j do_leave
+not_leave:
     j not_len5
 not_len5:
 
@@ -701,14 +885,12 @@ emit_instr:
 # addi s4, s4, -4   (push TOS to stack)
 # sw   s3, 0(s4)
 emit_dup:
-    # addi s4, s4, -4 = addi x20, x20, -4
-    # I-type: imm=-4=0xFFC, rs1=x20, funct3=0, rd=x20, op=0x13
-    # = 0xFFC_A0_0_A0_13 ... let me compute properly
-    # (0xFFC << 20) | (20 << 15) | (0 << 12) | (20 << 7) | 0x13
-    # = 0xFFC00000 | 0x000A0000 | 0 | 0x00000A00 | 0x13
-    # = 0xFFCA0A13
-    lui t0, 0xFFCA1        # 0xFFCA1000 (adjust: 0xA13 has bit 11 set? 0xA13=0b1010_0001_0011, bit11=1 so +1 to lui)
-    addi t0, t0, -0x5ED    # 0xFFCA1000 - 0x5ED = 0xFFCA0A13
+    addi a0, zero, 0
+    j emit_stk_check
+push_dup_cont:
+    # addi x20, x20, -4 = 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
     sw t0, 0(s3)
     addi s3, s3, 4
     # sw s3, 0(s4) — but wait, in compiled code s3=TOS, s4=DSP
@@ -726,6 +908,9 @@ emit_dup:
 # lw   s3, 0(s4)
 # addi s4, s4, 4
 emit_drop:
+    addi a0, zero, 11
+    j emit_underflow_check
+pop_drop_cont:
     # lw x19, 0(x20): I-type: imm=0, rs1=x20, funct3=2, rd=x19, op=0x03
     # = (0<<20)|(20<<15)|(2<<12)|(19<<7)|0x03
     # = 0x000A2983
@@ -769,6 +954,9 @@ emit_swap:
 # sw   s3, 0(s4)      push TOS
 # lw   s3, 4(s4)      TOS = old second (now at offset 4)
 emit_over:
+    addi a0, zero, 1
+    j emit_stk_check
+push_over_cont:
     # addi x20, x20, -4: 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
@@ -791,6 +979,9 @@ emit_over:
 # addi s4, s4, 4
 # add  s3, t0, s3     TOS = second + TOS
 emit_plus:
+    addi a0, zero, 12
+    j emit_underflow_check
+pop_plus_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -814,6 +1005,9 @@ emit_plus:
 # addi s4, s4, 4
 # sub  s3, t0, s3     TOS = second - TOS
 emit_minus:
+    addi a0, zero, 13
+    j emit_underflow_check
+pop_minus_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -837,6 +1031,9 @@ emit_minus:
 # addi s4, s4, 4
 # and  s3, t0, s3
 emit_and:
+    addi a0, zero, 14
+    j emit_underflow_check
+pop_and_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -860,6 +1057,9 @@ emit_and:
 # addi s4, s4, 4
 # or   s3, t0, s3
 emit_or:
+    addi a0, zero, 15
+    j emit_underflow_check
+pop_or_cont:
     # or x19, x5, x19: (0<<25)|(19<<20)|(5<<15)|(6<<12)|(19<<7)|0x33
     # = 0x0132E9B3
     lui t0, 0x000A2
@@ -882,6 +1082,9 @@ emit_or:
 # addi s4, s4, 4
 # xor  s3, t0, s3
 emit_xor:
+    addi a0, zero, 16
+    j emit_underflow_check
+pop_xor_cont:
     lui t0, 0x000A2
     addi t0, t0, 0x283
     sw t0, 0(s3)
@@ -905,6 +1108,9 @@ emit_xor:
 # seqz s3, t0         s3 = 1 if equal
 # neg  s3, s3         s3 = -1 (true) or 0 (false)
 emit_eq:
+    addi a0, zero, 17
+    j emit_underflow_check
+pop_eq_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -941,6 +1147,9 @@ emit_eq:
 # slt  s3, t0, s3     s3 = 1 if second < TOS
 # neg  s3, s3         s3 = -1 or 0
 emit_lt:
+    addi a0, zero, 18
+    j emit_underflow_check
+pop_lt_cont:
     lui t0, 0x000A2
     addi t0, t0, 0x283
     sw t0, 0(s3)
@@ -968,6 +1177,9 @@ emit_lt:
 # slt  s3, s3, t0     s3 = 1 if TOS < second (i.e. second > TOS)
 # neg  s3, s3
 emit_gt:
+    addi a0, zero, 19
+    j emit_underflow_check
+pop_gt_cont:
     lui t0, 0x000A2
     addi t0, t0, 0x283
     sw t0, 0(s3)
@@ -1007,6 +1219,9 @@ emit_fetch:
 # lw   s3, 0(s4)       pop new TOS
 # addi s4, s4, 4
 emit_store:
+    addi a0, zero, 20
+    j emit_underflow_check
+pop_store1_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -1017,13 +1232,22 @@ emit_store:
     addi t0, t0, -0x5ED
     sw t0, 0(s3)
     addi s3, s3, 4
-    # sw x5, 0(x19): S-type imm=0, rs2=x5, rs1=x19, funct3=2, op=0x23
-    # = (0<<25)|(5<<20)|(19<<15)|(2<<12)|(0<<7)|0x23
-    # = 0x0059A023
+    # Store protection check
+    addi a0, zero, 34
+    j emit_store_check
+store_prot1_cont:
+    # Heap upper bound check (addr < s6)
+    addi a0, zero, 42
+    j emit_heap_check
+heap_store1_cont:
+    # sw x5, 0(x19): 0x0059A023
     lui t0, 0x0059A
     addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
+    addi a0, zero, 21
+    j emit_underflow_check
+pop_store2_cont:
     # lw x19, 0(x20): 0x000A2983
     lui t0, 0x000A3
     addi t0, t0, -0x67D
@@ -1054,6 +1278,9 @@ emit_cfetch:
 # lw   s3, 0(s4)
 # addi s4, s4, 4
 emit_cstore:
+    addi a0, zero, 22
+    j emit_underflow_check
+pop_cstore1_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -1064,13 +1291,22 @@ emit_cstore:
     addi t0, t0, -0x5ED
     sw t0, 0(s3)
     addi s3, s3, 4
-    # sb x5, 0(x19): S-type imm=0, rs2=x5, rs1=x19, funct3=0, op=0x23
-    # = (0<<25)|(5<<20)|(19<<15)|(0<<12)|(0<<7)|0x23
-    # = 0x00598023
+    # Store protection check
+    addi a0, zero, 35
+    j emit_store_check
+store_prot2_cont:
+    # Heap upper bound check (addr < s6)
+    addi a0, zero, 43
+    j emit_heap_check
+heap_store2_cont:
+    # sb x5, 0(x19): 0x00598023
     lui t0, 0x00598
     addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
+    addi a0, zero, 23
+    j emit_underflow_check
+pop_cstore2_cont:
     # lw x19, 0(x20): 0x000A2983
     lui t0, 0x000A3
     addi t0, t0, -0x67D
@@ -1089,6 +1325,9 @@ emit_cstore:
 # sltu s3, t0, s3     s3 = 1 if second <u TOS
 # neg  s3, s3         s3 = -1 or 0
 emit_ult:
+    addi a0, zero, 24
+    j emit_underflow_check
+pop_ult_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -1116,6 +1355,9 @@ emit_ult:
 # addi s4, s4, 4
 # sll  s3, t0, s3     TOS = second << TOS
 emit_lshift:
+    addi a0, zero, 25
+    j emit_underflow_check
+pop_lshift_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -1138,6 +1380,9 @@ emit_lshift:
 # addi s4, s4, 4
 # srl  s3, t0, s3     TOS = second >> TOS (unsigned)
 emit_rshift:
+    addi a0, zero, 26
+    j emit_underflow_check
+pop_rshift_cont:
     # lw x5, 0(x20): 0x000A2283
     lui t0, 0x000A2
     addi t0, t0, 0x283
@@ -1180,6 +1425,9 @@ emit_negate:
 # sw   s3, 0(s4)
 # lui  s3, 0x80100    TOS = 0x80100000
 emit_here:
+    addi a0, zero, 2
+    j emit_stk_check
+push_here_cont:
     # addi x20, x20, -4: 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
@@ -1190,9 +1438,33 @@ emit_here:
     addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
-    # lui x19, 0x80100: 0x801009B7
-    lui t0, 0x80101        # bit11 of 9B7=1, +1
-    addi t0, t0, -0x649
+    # addi x5, x25, 0 (t0 = s9 = heap ptr addr): 0x000C8293
+    lui t0, 0x000C8
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # lw x19, 0(x5) (load heap pointer into TOS): 0x0002A983
+    lui t0, 0x0002B
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x19, x19, 3 (align step 1): 0x00398993
+    lui t0, 0x00399
+    addi t0, t0, -0x66D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # andi x19, x19, -4 (align step 2): 0xFFC9F993
+    lui t0, 0xFFCA0
+    addi t0, t0, -0x66D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Heap bounds check (TOS < s6)
+    addi a0, zero, 41
+    j emit_heap_check
+heap_here_cont:
+    # sw x19, 0(x5) (store aligned pointer back): 0x0132A023
+    lui t0, 0x0132A
+    addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
     j compile_loop
@@ -1241,6 +1513,9 @@ emit_emit:
     addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
+    addi a0, zero, 27
+    j emit_underflow_check
+pop_emit_cont:
     # lw x19, 0(x20): 0x000A2983
     lui t0, 0x000A3
     addi t0, t0, -0x67D
@@ -1262,6 +1537,9 @@ emit_emit:
 #   beq  t0, zero, -8   retry
 #   lbu  s3, 0(s5)      read byte into TOS
 emit_key:
+    addi a0, zero, 3
+    j emit_stk_check
+push_key_cont:
     # addi x20, x20, -4: 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
@@ -1340,6 +1618,16 @@ emit_rot:
 #   addi t0, t0, 0x555    FINISHER_PASS lower
 #   sw   t0, 0(s5)        trigger poweroff
 emit_bye:
+    # Check no unclosed colon definition
+    beqz tp, bye_def_ok
+    j error_unclosed_def
+bye_def_ok:
+    # Check control stack balanced
+    lui t0, 0x82800
+    addi t0, t0, 0x100
+    beq s9, t0, bye_ctrl_ok
+    j error_unmatched_ctrl
+bye_ctrl_ok:
     # lui x21, 0x100 = (0x100 << 12) | (21 << 7) | 0x37 = 0x00100AB7
     lui t0, 0x00101        # bit11 of AB7=1, +1
     addi t0, t0, -0x549
@@ -1372,6 +1660,9 @@ emit_bye:
 # Emit: consume TOS flag, branch-if-zero forward (patch later)
 # Push current output address onto control stack for THEN/ELSE to patch
 do_if:
+    addi a0, zero, 28
+    j emit_underflow_check
+pop_if_cont:
     # Emit: addi t0, s3, 0 (mv t0, TOS) : 0x00098293
     lui t0, 0x00098
     addi t0, t0, 0x293
@@ -1393,6 +1684,11 @@ do_if:
     addi t0, t0, 0x063
     sw t0, 0(s3)
     # Push address of this beq onto control stack (for patching)
+    lui t1, 0x82801
+    addi t1, t1, 0x100
+    bltu s9, t1, cstk_ok1
+    j error_cstk_overflow
+cstk_ok1:
     sw s3, 0(s9)
     addi s9, s9, 4
     addi s3, s3, 4
@@ -1403,9 +1699,14 @@ do_if:
 do_then:
     # Pop control stack, skipping leave markers (odd = leave, even = if-addr)
     lui t4, 0x82801
-    addi t4, t4, -0x100
+    addi t4, t4, 0x100
     addi t6, zero, 0
 then_skip_leaves:
+    lui t1, 0x82800
+    addi t1, t1, 0x100
+    bne s9, t1, cstk_uok1
+    j error_cstk_underflow
+cstk_uok1:
     addi s9, s9, -4
     lw t2, 0(s9)
     andi t1, t2, 1
@@ -1420,6 +1721,11 @@ then_got_if:
     beqz t6, then_no_repush
     addi t5, zero, 0
 then_repush:
+    lui t1, 0x82801
+    addi t1, t1, 0x100
+    bltu s9, t1, cstk_ok2
+    j error_cstk_overflow
+cstk_ok2:
     slli t1, t5, 2
     add t1, t4, t1
     lw t0, 0(t1)
@@ -1509,9 +1815,14 @@ patch_jal:
 do_else:
     # Pop control stack, skipping leave markers
     lui t4, 0x82801
-    addi t4, t4, -0x100
+    addi t4, t4, 0x100
     addi t6, zero, 0
 else_skip_leaves:
+    lui t1, 0x82800
+    addi t1, t1, 0x100
+    bne s9, t1, cstk_uok2
+    j error_cstk_underflow
+cstk_uok2:
     addi s9, s9, -4
     lw t2, 0(s9)
     andi t1, t2, 1
@@ -1526,6 +1837,11 @@ else_got_if:
     beqz t6, else_no_repush
     addi t5, zero, 0
 else_repush:
+    lui t1, 0x82801
+    addi t1, t1, 0x100
+    bltu s9, t1, cstk_ok3
+    j error_cstk_overflow
+cstk_ok3:
     slli t1, t5, 2
     add t1, t4, t1
     lw t0, 0(t1)
@@ -1570,6 +1886,11 @@ else_no_repush:
     sw t5, 0(t2)
 
     # Push the jal address for THEN to patch
+    lui t1, 0x82801
+    addi t1, t1, 0x100
+    bltu s9, t1, cstk_ok4
+    j error_cstk_overflow
+cstk_ok4:
     sw t6, 0(s9)
     addi s9, s9, 4
     j compile_loop
@@ -1577,6 +1898,11 @@ else_no_repush:
 # --- BEGIN ---
 # Push current output address onto control stack (backward target)
 do_begin:
+    lui t0, 0x82801
+    addi t0, t0, 0x100
+    bltu s9, t0, cstk_ok5
+    j error_cstk_overflow
+cstk_ok5:
     sw s3, 0(s9)
     addi s9, s9, 4
     j compile_loop
@@ -1584,6 +1910,9 @@ do_begin:
 # --- UNTIL ---
 # Pop flag, branch back to BEGIN if zero
 do_until:
+    addi a0, zero, 29
+    j emit_underflow_check
+pop_until_cont:
     # Emit: mv t0, s3 (addi t0, s3, 0): 0x00098293
     lui t0, 0x00098
     addi t0, t0, 0x293
@@ -1600,6 +1929,11 @@ do_until:
     sw t0, 0(s3)
     addi s3, s3, 4
     # Pop BEGIN address from control stack
+    lui t1, 0x82800
+    addi t1, t1, 0x100
+    bne s9, t1, cstk_uok3
+    j error_cstk_underflow
+cstk_uok3:
     addi s9, s9, -4
     lw t2, 0(s9)
     # Compute backward offset: BEGIN_addr - current_pos
@@ -1637,6 +1971,10 @@ do_until:
 # --- exit (early return from word) ---
 # Same return sequence as semicolon: pop shadow stack, load ID, jal dispatch
 do_exit:
+    # Shadow underflow check before pop
+    addi a0, zero, 37
+    j emit_shadow_underflow_check
+shadow_exit_cont:
     # Emit: addi x18, x18, -4 = 0xFFC90913
     lui t0, 0xFFC91
     addi t0, t0, -0x6ED
@@ -1650,6 +1988,10 @@ do_exit:
     # Emit: jal x0, 0 (placeholder for dispatch)
     addi t0, zero, 0x6F
     sw t0, 0(s3)
+    lui t1, 0x82850
+    bltu s11, t1, patch_ok1
+    j error_patch_overflow
+patch_ok1:
     sw s3, 0(s11)
     addi s11, s11, 4
     addi s3, s3, 4
@@ -1658,6 +2000,9 @@ do_exit:
 # --- while (begin ... cond while ... repeat) ---
 # Same as if: consume TOS, branch-if-zero forward, push beq addr
 do_while:
+    addi a0, zero, 30
+    j emit_underflow_check
+pop_while_cont:
     # Emit: addi t0, s3, 0 (mv t0, TOS): 0x00098293
     lui t0, 0x00098
     addi t0, t0, 0x293
@@ -1677,6 +2022,11 @@ do_while:
     lui t0, 0x00028
     addi t0, t0, 0x063
     sw t0, 0(s3)
+    lui t1, 0x82801
+    addi t1, t1, 0x100
+    bltu s9, t1, cstk_ok6
+    j error_cstk_overflow
+cstk_ok6:
     sw s3, 0(s9)
     addi s9, s9, 4
     addi s3, s3, 4
@@ -1686,9 +2036,17 @@ do_while:
 # Pop while's beq addr, pop begin addr, emit jal back to begin, patch while's beq
 do_repeat:
     # Pop while's beq address
+    lui t1, 0x82800
+    addi t1, t1, 0x100
+    bne s9, t1, cstk_uok4a
+    j error_cstk_underflow
+cstk_uok4a:
     addi s9, s9, -4
     lw t2, 0(s9)
     # Pop begin address
+    bne s9, t1, cstk_uok4b
+    j error_cstk_underflow
+cstk_uok4b:
     addi s9, s9, -4
     lw t4, 0(s9)
 
@@ -1757,6 +2115,9 @@ do_do:
     addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
+    addi a0, zero, 31
+    j emit_underflow_check
+pop_do1_cont:
     # Emit: lw x5, 0(x20) — load limit
     # = 0x000A2283
     lui t0, 0x000A2
@@ -1781,6 +2142,13 @@ do_do:
     addi t0, t0, -0x6ED
     sw t0, 0(s3)
     addi s3, s3, 4
+    # Shadow stack overflow check for DO loop
+    addi a0, zero, 10
+    j emit_shadow_check
+shadow_do_cont:
+    addi a0, zero, 32
+    j emit_underflow_check
+pop_do2_cont:
     # Emit: lw x19, 0(x20) — pop new TOS
     # = 0x000A2983
     lui t0, 0x000A3
@@ -1794,6 +2162,11 @@ do_do:
     sw t0, 0(s3)
     addi s3, s3, 4
     # Push loop body start onto control stack
+    lui t0, 0x82801
+    addi t0, t0, 0x100
+    bltu s9, t0, cstk_ok7
+    j error_cstk_overflow
+cstk_ok7:
     sw s3, 0(s9)
     addi s9, s9, 4
     j compile_loop
@@ -1802,9 +2175,14 @@ do_do:
 do_loop:
     # Pop control stack entries: skip leave markers (odd), find do-body addr (even)
     lui t4, 0x82801
-    addi t4, t4, -0x100         # scratch area for leave addrs (0x82800F00)
+    addi t4, t4, 0x100          # scratch area for leave addrs (0x82801100)
     addi t6, zero, 0            # leave count
 loop_pop_cs:
+    lui t1, 0x82800
+    addi t1, t1, 0x100
+    bne s9, t1, cstk_uok5
+    j error_cstk_underflow
+cstk_uok5:
     addi s9, s9, -4
     lw t2, 0(s9)
     andi t1, t2, 1              # check if odd (leave marker)
@@ -1869,6 +2247,14 @@ loop_got_body:
     or t5, t5, t0
     sw t5, 0(s3)
     addi s3, s3, 4
+    # Shadow underflow check before popping loop params
+    addi a2, t4, 0
+    addi a3, t6, 0
+    addi a0, zero, 38
+    j emit_shadow_underflow_check
+shadow_loop_cont:
+    addi t4, a2, 0
+    addi t6, a3, 0
     # Emit: addi x18, x18, -8 — pop loop params = 0xFF890913
     lui t0, 0xFF891
     addi t0, t0, -0x6ED
@@ -1913,6 +2299,9 @@ loop_no_leaves:
 
 # --- i (push loop index onto data stack) ---
 emit_i:
+    addi a0, zero, 4
+    j emit_stk_check
+push_i_cont:
     # Emit: addi x20, x20, -4 = 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
@@ -1932,6 +2321,9 @@ emit_i:
 
 # --- j (push outer loop index onto data stack) ---
 emit_j:
+    addi a0, zero, 5
+    j emit_stk_check
+push_j_cont:
     # Emit: addi x20, x20, -4 = 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
@@ -1959,9 +2351,14 @@ emit_j:
 do_ploop:
     # Pop control stack entries: skip leave markers (odd), find do-body addr (even)
     lui t4, 0x82801
-    addi t4, t4, -0x100         # scratch area for leave addrs (0x82800F00)
+    addi t4, t4, 0x100          # scratch area for leave addrs (0x82801100)
     addi t6, zero, 0            # leave count
 ploop_pop_cs:
+    lui t1, 0x82800
+    addi t1, t1, 0x100
+    bne s9, t1, cstk_uok6
+    j error_cstk_underflow
+cstk_uok6:
     addi s9, s9, -4
     lw t2, 0(s9)
     andi t1, t2, 1
@@ -1989,6 +2386,13 @@ ploop_got_body:
     addi t0, t0, 0x303
     sw t0, 0(s3)
     addi s3, s3, 4
+    addi a2, t4, 0
+    addi a3, t6, 0
+    addi a0, zero, 33
+    j emit_underflow_check
+pop_ploop_cont:
+    addi t4, a2, 0
+    addi t6, a3, 0
     # Emit: lw x19, 0(x20) — pop new TOS (consume increment) = 0x000A2983
     lui t0, 0x000A3
     addi t0, t0, -0x67D
@@ -2034,6 +2438,14 @@ ploop_got_body:
     or t5, t5, t0
     sw t5, 0(s3)
     addi s3, s3, 4
+    # Shadow underflow check before popping loop params
+    addi a2, t4, 0
+    addi a3, t6, 0
+    addi a0, zero, 39
+    j emit_shadow_underflow_check
+shadow_ploop_cont:
+    addi t4, a2, 0
+    addi t6, a3, 0
     # Emit: addi x18, x18, -8 — pop loop params = 0xFF890913
     lui t0, 0xFF891
     addi t0, t0, -0x6ED
@@ -2099,6 +2511,10 @@ ploop_no_leaves:
 # by storing them as (addr | 1) — odd values are leave patches, even values
 # are loop targets.
 do_leave:
+    # Shadow underflow check before popping loop params
+    addi a0, zero, 40
+    j emit_shadow_underflow_check
+shadow_leave_cont:
     # Emit: addi x18, x18, -8 — pop loop params from shadow stack
     # = 0xFF890913
     lui t0, 0xFF891
@@ -2109,6 +2525,11 @@ do_leave:
     addi t0, zero, 0x6F
     sw t0, 0(s3)
     # Push (address | 1) onto control stack to mark as leave
+    lui t1, 0x82801
+    addi t1, t1, 0x100
+    bltu s9, t1, cstk_ok8
+    j error_cstk_overflow
+cstk_ok8:
     ori t0, s3, 1
     sw t0, 0(s9)
     addi s9, s9, 4
@@ -2176,7 +2597,9 @@ sq_aligned:
     sw t0, 0(t4)                # patch skip jal
 
     # Emit code to push (addr, len) onto data stack
-    # Push current TOS, then load addr, then push addr, load len
+    addi a0, zero, 6
+    j emit_stk_check
+push_sq1_cont:
     # addi x20, x20, -4 (make room): 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
@@ -2187,38 +2610,32 @@ sq_aligned:
     addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
+    addi a0, zero, 7
+    j emit_stk_check
+push_sq2_cont:
     # addi x20, x20, -4 (make room for addr): 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # Compute the runtime address of the string.
-    # At runtime, the string data is at a fixed offset from the start of the binary.
-    # We need to emit instructions that load the absolute address of the string.
-    # String is at output offset (t2 - output_base). The runtime load address is 0x80000000.
-    # So runtime string addr = 0x80000000 + (t2 - s8) where s8 = output base.
-    # We emit: lui x19, upper; addi x19, x19, lower
-    # But the address is only known at compile time, so we compute and embed it.
-    sub t5, t2, s8              # offset from output base
-    lui t6, 0x80000             # runtime base
-    add t5, t5, t6              # runtime string address
+    # Compute PC-relative offset from auipc position to string data.
+    # t2 = string start in output buffer, s3 = where auipc will be emitted.
+    sub t5, t2, s3              # offset = string_pos - auipc_pos (negative)
 
-    # Emit: load string address into x19
-    # Split t5 into upper20 + lower12
+    # Split t5 into upper20 + lower12 (signed)
     slli t6, t5, 20
-    srli t6, t6, 20             # t6 = t5 & 0xFFF (lower 12)
-    srli t0, t5, 12             # upper 20
-    # Check sign extension compensation
+    srli t6, t6, 20             # t6 = lower 12 bits
+    srai t0, t5, 12             # upper 20 (arithmetic shift for sign)
     srli t1, t6, 11
     andi t1, t1, 1
     add t0, t0, t1              # adjust upper if bit11 of lower is set
 
-    # Emit: lui x19, upper
+    # Emit: auipc x19, upper20
     slli t0, t0, 12
     addi t1, zero, 19
     slli t1, t1, 7
-    ori t1, t1, 0x37
+    ori t1, t1, 0x17            # auipc opcode
     or t0, t0, t1
     sw t0, 0(s3)
     addi s3, s3, 4
@@ -2258,6 +2675,11 @@ sq_aligned:
 # Parse the next word (the name), create a dictionary entry pointing to
 # the current output position.
 do_colon:
+    # Check for nested colon definition
+    beqz tp, colon_ok
+    j error_nested_colon
+colon_ok:
+    addi tp, zero, 1            # set inside-definition flag
     # Skip whitespace to get the name
     j skip_ws_colon
 skip_ws_colon:
@@ -2306,18 +2728,36 @@ rcn_done:
     addi t0, zero, 0x6F
     sw t0, 0(s3)
     # Push this jal's address onto control stack for ; to patch
+    lui t1, 0x82801
+    addi t1, t1, 0x100
+    bltu s9, t1, cstk_ok9
+    j error_cstk_overflow
+cstk_ok9:
     sw s3, 0(s9)
     addi s9, s9, 4
     addi s3, s3, 4
     # Store current output position (after the jal) as body address
     sw s3, 32(s4)
-    # Advance dictionary pointer by 36
+    # Advance dictionary pointer by 36 (check dictionary limit: 0x82800000)
     addi s4, s4, 36
+    lui t0, 0x82800
+    bltu s4, t0, dict_ok
+    j error_dict_overflow
+dict_ok:
     j compile_loop
 
 # ; (semicolon) — end a word definition
 # Emit the return sequence: pop shadow stack, jal dispatch
 do_semicolon:
+    # Check for semicolon outside definition
+    bnez tp, semi_ok
+    j error_semi_outside
+semi_ok:
+    addi tp, zero, 0            # clear inside-definition flag
+    # Shadow underflow check before pop
+    addi a0, zero, 36
+    j emit_shadow_underflow_check
+shadow_semi_cont:
     # Emit: addi s2, s2, -4 (pop shadow stack)
     # addi x18, x18, -4 = 0xFFC90913
     lui t0, 0xFFC91
@@ -2334,6 +2774,10 @@ do_semicolon:
     addi t0, zero, 0x6F     # jal x0, 0 (placeholder)
     sw t0, 0(s3)
     # Record this location in the patch list
+    lui t1, 0x82850
+    bltu s11, t1, patch_ok2
+    j error_patch_overflow
+patch_ok2:
     sw s3, 0(s11)
     addi s11, s11, 4
     addi s3, s3, 4
@@ -2421,12 +2865,18 @@ dl_found:
     sw t0, 0(s3)
     addi s3, s3, 4
 
+    # Shadow stack overflow check
+    addi a2, t6, 0
+    addi a0, zero, 9
+    j emit_shadow_check
+shadow_call_cont:
+    addi t6, a2, 0
+
     # Record call site: store current output address + dispatch ID
     # The call site address (where execution resumes after return) is s3+4
     # (after the jal we're about to emit)
     # Store in call site list for dispatch table generation
-    lui t4, 0x82800
-    addi t4, t4, 0x900      # call site list base: 0x82800900
+    lui t4, 0x82850         # call site list base: 0x82850000
     slli t5, s10, 2         # offset = id * 4
     add t4, t4, t5
     addi t5, s3, 4          # call site address = after the jal
@@ -2460,7 +2910,11 @@ dl_found:
     sw t5, 0(s3)
     addi s3, s3, 4
 
-    # Increment dispatch ID
+    # Increment dispatch ID (check call site limit: 65536 = 0x10000)
+    lui t0, 0x10
+    bltu s10, t0, call_ok
+    j error_call_overflow
+call_ok:
     addi s10, s10, 1
     j compile_loop
 
@@ -2516,7 +2970,9 @@ apply_neg:
     sub t2, zero, t2         # negate
 
 emit_literal:
-    # Emit code to push t2 (the number) onto the data stack
+    addi a0, zero, 8
+    j emit_stk_check
+push_lit_cont:
     # addi s4, s4, -4: 0xFFCA0A13
     lui t0, 0xFFCA1
     addi t0, t0, -0x5ED
@@ -2581,10 +3037,368 @@ big_literal:
     j compile_loop
 
 # ============================================================================
-# Error: print "? <word>\n" via UART, then halt
-# Expects: s5 = UART base, s6 = null-terminated word buffer
+# Shared runtime check emitter
+# Emits: bltu <check>, +8 ; jal x0, <offset_to_error_handler>
+# Uses: t0, t4, t5, t6, a0, a1 (preserves t2, t3, ra)
+# ra = error handler output address
+# a0 = dispatch return ID
+# ============================================================================
+emit_shadow_underflow_check:
+    lui a1, 0x012D6
+    addi a1, a1, 0x463
+    j emit_rt_check
+emit_heap_check:
+    lui a1, 0x0169E
+    addi a1, a1, 0x463
+    j emit_rt_check
+emit_underflow_check:
+    lui a1, 0x017A6
+    addi a1, a1, 0x463
+    j emit_rt_check
+emit_store_check:
+    lui a1, 0x0199F
+    addi a1, a1, 0x463
+    j emit_rt_check
+emit_stk_check:
+    lui a1, 0x014B6
+    addi a1, a1, 0x463
+    j emit_rt_check
+emit_shadow_check:
+    lui a1, 0x01896
+    addi a1, a1, 0x463
+emit_rt_check:
+    sw a1, 0(s3)
+    addi s3, s3, 4
+    sub t4, ra, s3
+    srli t5, t4, 20
+    andi t5, t5, 1
+    slli t5, t5, 31
+    srli t6, t4, 1
+    andi t6, t6, 0x3FF
+    slli t6, t6, 21
+    or t5, t5, t6
+    srli t6, t4, 11
+    andi t6, t6, 1
+    slli t6, t6, 20
+    or t5, t5, t6
+    srli t6, t4, 12
+    andi t6, t6, 0xFF
+    slli t6, t6, 12
+    or t5, t5, t6
+    addi t6, zero, 0x6F
+    or t5, t5, t6
+    sw t5, 0(s3)
+    addi s3, s3, 4
+    beqz a0, rtc0
+    addi a0, a0, -1
+    beqz a0, rtc1
+    addi a0, a0, -1
+    beqz a0, rtc2
+    addi a0, a0, -1
+    beqz a0, rtc3
+    addi a0, a0, -1
+    beqz a0, rtc4
+    addi a0, a0, -1
+    beqz a0, rtc5
+    addi a0, a0, -1
+    beqz a0, rtc6
+    addi a0, a0, -1
+    beqz a0, rtc7
+    addi a0, a0, -1
+    beqz a0, rtc8
+    addi a0, a0, -1
+    beqz a0, rtc9
+    addi a0, a0, -1
+    beqz a0, rtc10
+    addi a0, a0, -1
+    beqz a0, rtc11
+    addi a0, a0, -1
+    beqz a0, rtc12
+    addi a0, a0, -1
+    beqz a0, rtc13
+    addi a0, a0, -1
+    beqz a0, rtc14
+    addi a0, a0, -1
+    beqz a0, rtc15
+    addi a0, a0, -1
+    beqz a0, rtc16
+    addi a0, a0, -1
+    beqz a0, rtc17
+    addi a0, a0, -1
+    beqz a0, rtc18
+    addi a0, a0, -1
+    beqz a0, rtc19
+    addi a0, a0, -1
+    beqz a0, rtc20
+    addi a0, a0, -1
+    beqz a0, rtc21
+    addi a0, a0, -1
+    beqz a0, rtc22
+    addi a0, a0, -1
+    beqz a0, rtc23
+    addi a0, a0, -1
+    beqz a0, rtc24
+    addi a0, a0, -1
+    beqz a0, rtc25
+    addi a0, a0, -1
+    beqz a0, rtc26
+    addi a0, a0, -1
+    beqz a0, rtc27
+    addi a0, a0, -1
+    beqz a0, rtc28
+    addi a0, a0, -1
+    beqz a0, rtc29
+    addi a0, a0, -1
+    beqz a0, rtc30
+    addi a0, a0, -1
+    beqz a0, rtc31
+    addi a0, a0, -1
+    beqz a0, rtc32
+    addi a0, a0, -1
+    beqz a0, rtc33
+    addi a0, a0, -1
+    beqz a0, rtc34
+    addi a0, a0, -1
+    beqz a0, rtc35
+    addi a0, a0, -1
+    beqz a0, rtc36
+    addi a0, a0, -1
+    beqz a0, rtc37
+    addi a0, a0, -1
+    beqz a0, rtc38
+    addi a0, a0, -1
+    beqz a0, rtc39
+    addi a0, a0, -1
+    beqz a0, rtc40
+    addi a0, a0, -1
+    beqz a0, rtc41
+    addi a0, a0, -1
+    beqz a0, rtc42
+    j rtc43
+rtc0:
+    j push_dup_cont
+rtc1:
+    j push_over_cont
+rtc2:
+    j push_here_cont
+rtc3:
+    j push_key_cont
+rtc4:
+    j push_i_cont
+rtc5:
+    j push_j_cont
+rtc6:
+    j push_sq1_cont
+rtc7:
+    j push_sq2_cont
+rtc8:
+    j push_lit_cont
+rtc9:
+    j shadow_call_cont
+rtc10:
+    j shadow_do_cont
+rtc11:
+    j pop_drop_cont
+rtc12:
+    j pop_plus_cont
+rtc13:
+    j pop_minus_cont
+rtc14:
+    j pop_and_cont
+rtc15:
+    j pop_or_cont
+rtc16:
+    j pop_xor_cont
+rtc17:
+    j pop_eq_cont
+rtc18:
+    j pop_lt_cont
+rtc19:
+    j pop_gt_cont
+rtc20:
+    j pop_store1_cont
+rtc21:
+    j pop_store2_cont
+rtc22:
+    j pop_cstore1_cont
+rtc23:
+    j pop_cstore2_cont
+rtc24:
+    j pop_ult_cont
+rtc25:
+    j pop_lshift_cont
+rtc26:
+    j pop_rshift_cont
+rtc27:
+    j pop_emit_cont
+rtc28:
+    j pop_if_cont
+rtc29:
+    j pop_until_cont
+rtc30:
+    j pop_while_cont
+rtc31:
+    j pop_do1_cont
+rtc32:
+    j pop_do2_cont
+rtc33:
+    j pop_ploop_cont
+rtc34:
+    j store_prot1_cont
+rtc35:
+    j store_prot2_cont
+rtc36:
+    j shadow_semi_cont
+rtc37:
+    j shadow_exit_cont
+rtc38:
+    j shadow_loop_cont
+rtc39:
+    j shadow_ploop_cont
+rtc40:
+    j shadow_leave_cont
+rtc41:
+    j heap_here_cont
+rtc42:
+    j heap_store1_cont
+rtc43:
+    j heap_store2_cont
+
+# ============================================================================
+# Error handlers: write error name to word buffer, then fall through/jump to error_word
+# ============================================================================
+error_name_overflow:
+    addi t0, zero, 110        # 'n'
+    sb t0, 0(s6)
+    addi t0, zero, 97         # 'a'
+    sb t0, 1(s6)
+    addi t0, zero, 109        # 'm'
+    sb t0, 2(s6)
+    addi t0, zero, 101        # 'e'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_cstk_overflow:
+    addi t0, zero, 99         # 'c'
+    sb t0, 0(s6)
+    addi t0, zero, 115        # 's'
+    sb t0, 1(s6)
+    addi t0, zero, 116        # 't'
+    sb t0, 2(s6)
+    addi t0, zero, 107        # 'k'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_cstk_underflow:
+    addi t0, zero, 117        # 'u'
+    sb t0, 0(s6)
+    addi t0, zero, 110        # 'n'
+    sb t0, 1(s6)
+    addi t0, zero, 100        # 'd'
+    sb t0, 2(s6)
+    addi t0, zero, 102        # 'f'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_patch_overflow:
+    addi t0, zero, 112        # 'p'
+    sb t0, 0(s6)
+    addi t0, zero, 97         # 'a'
+    sb t0, 1(s6)
+    addi t0, zero, 116        # 't'
+    sb t0, 2(s6)
+    addi t0, zero, 99         # 'c'
+    sb t0, 3(s6)
+    addi t0, zero, 104        # 'h'
+    sb t0, 4(s6)
+    sb zero, 5(s6)
+    j error_word
+
+error_call_overflow:
+    addi t0, zero, 99         # 'c'
+    sb t0, 0(s6)
+    addi t0, zero, 97         # 'a'
+    sb t0, 1(s6)
+    addi t0, zero, 108        # 'l'
+    sb t0, 2(s6)
+    addi t0, zero, 108        # 'l'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_dict_overflow:
+    addi t0, zero, 100        # 'd'
+    sb t0, 0(s6)
+    addi t0, zero, 105        # 'i'
+    sb t0, 1(s6)
+    addi t0, zero, 99         # 'c'
+    sb t0, 2(s6)
+    addi t0, zero, 116        # 't'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_output_overflow:
+    addi t0, zero, 102        # 'f'
+    sb t0, 0(s6)
+    addi t0, zero, 117        # 'u'
+    sb t0, 1(s6)
+    addi t0, zero, 108        # 'l'
+    sb t0, 2(s6)
+    addi t0, zero, 108        # 'l'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_unclosed_def:
+    addi t0, zero, 100        # 'd'
+    sb t0, 0(s6)
+    addi t0, zero, 101        # 'e'
+    sb t0, 1(s6)
+    addi t0, zero, 102        # 'f'
+    sb t0, 2(s6)
+    sb zero, 3(s6)
+    j error_word
+
+error_unmatched_ctrl:
+    addi t0, zero, 99         # 'c'
+    sb t0, 0(s6)
+    addi t0, zero, 116        # 't'
+    sb t0, 1(s6)
+    addi t0, zero, 114        # 'r'
+    sb t0, 2(s6)
+    addi t0, zero, 108        # 'l'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_nested_colon:
+    addi t0, zero, 110        # 'n'
+    sb t0, 0(s6)
+    addi t0, zero, 101        # 'e'
+    sb t0, 1(s6)
+    addi t0, zero, 115        # 's'
+    sb t0, 2(s6)
+    addi t0, zero, 116        # 't'
+    sb t0, 3(s6)
+    sb zero, 4(s6)
+    j error_word
+
+error_semi_outside:
+    addi t0, zero, 59         # ';'
+    sb t0, 0(s6)
+    sb zero, 1(s6)
+    j error_word
+
+# ============================================================================
+# Error: print "? <line>: <word>\n" via UART, then halt
+# Expects: s5 = UART base, s6 = null-terminated word buffer, gp = line number
 # ============================================================================
 error_word:
+    # Print "? "
     addi t0, zero, 63          # '?'
 ew_w1:
     lbu t1, 5(s5)
@@ -2597,6 +3411,52 @@ ew_w2:
     andi t1, t1, 32
     beqz t1, ew_w2
     sb t0, 0(s5)
+    # Print line number (decimal) from gp
+    # Convert gp to decimal digits on stack, then print them
+    addi t2, gp, 0             # t2 = remaining value
+    addi t3, zero, 0           # t3 = digit count
+ew_div10:
+    addi t4, zero, 10
+    addi t5, zero, 0           # quotient
+    addi t6, t2, 0             # dividend
+ew_div_loop:
+    blt t6, t4, ew_div_done
+    sub t6, t6, t4
+    addi t5, t5, 1
+    j ew_div_loop
+ew_div_done:
+    # t5 = quotient, t6 = remainder (digit)
+    addi t6, t6, 48            # ASCII digit
+    addi s4, s4, -4
+    sw t6, 0(s4)               # push digit onto data stack (repurposed as scratch)
+    addi t3, t3, 1             # digit count++
+    addi t2, t5, 0             # continue with quotient
+    bnez t2, ew_div10
+    # Print digits (they're on the stack in reverse order, so pop = correct order)
+ew_print_digits:
+    lw t0, 0(s4)
+    addi s4, s4, 4
+ew_wd:
+    lbu t1, 5(s5)
+    andi t1, t1, 32
+    beqz t1, ew_wd
+    sb t0, 0(s5)
+    addi t3, t3, -1
+    bnez t3, ew_print_digits
+    # Print ": "
+    addi t0, zero, 58          # ':'
+ew_wc:
+    lbu t1, 5(s5)
+    andi t1, t1, 32
+    beqz t1, ew_wc
+    sb t0, 0(s5)
+    addi t0, zero, 32          # ' '
+ew_ws:
+    lbu t1, 5(s5)
+    andi t1, t1, 32
+    beqz t1, ew_ws
+    sb t0, 0(s5)
+    # Print word name from word buffer
     addi t2, zero, 0           # index into word buffer
 ew_loop:
     add t3, s6, t2
@@ -2617,6 +3477,11 @@ ew_w4:
     beqz t1, ew_w4
     sb t0, 0(s5)
 error_halt:
+    # Shut down QEMU so the compiler exits instead of hanging
+    lui t0, 0x100
+    lui t1, 5
+    addi t1, t1, 0x555
+    sw t1, 0(t0)
     j error_halt
 
 # ============================================================================
@@ -2643,9 +3508,8 @@ ctrl_ok:
     addi t2, s3, 0           # t2 = dispatch table start address
 
     # First, patch all jal-to-dispatch placeholders
-    # Patch list starts at 0x82800500, ends at s11
-    lui t3, 0x82800
-    addi t3, t3, 0x500       # patch list base
+    # Patch list starts at 0x82810000, ends at s11
+    lui t3, 0x82810           # patch list base: 0x82810000
 patch_loop:
     beq t3, s11, emit_dispatch  # done patching
     lw t4, 0(t3)            # address of jal instruction to patch
@@ -2681,8 +3545,7 @@ patch_loop:
 # Emit the dispatch table entries
 emit_dispatch:
     addi t3, zero, 0         # current ID counter
-    lui t4, 0x82800
-    addi t4, t4, 0x900       # call site list base
+    lui t4, 0x82850          # call site list base: 0x82850000
 
 disp_loop:
     beq t3, s10, disp_done   # emitted all entries
@@ -2750,6 +3613,35 @@ disp_done:
     addi t0, zero, 0x6F     # jal x0, offset=0 loops forever
     sw t0, 0(s3)
     addi s3, s3, 4
+
+    # --- Patch auipc/addi for PIC (prologue words 2-3) ---
+    # Must happen here (after dispatch table + safety jal) so s3 = true end.
+    # offset = code_size - 8 (distance from auipc at word 2 to end of binary)
+    sub t0, s3, s8          # t0 = code_size = output_ptr - output_base
+    addi t0, t0, -8         # t0 = offset from auipc to here
+
+    # Split into upper20 + lower12 with sign-extension adjustment
+    slli t1, t0, 20
+    srli t1, t1, 20          # t1 = lower 12 bits
+    srli t2, t0, 12          # t2 = upper 20 bits (no adjustment yet)
+    srli t3, t0, 11
+    andi t3, t3, 1            # t3 = bit 11 (sign of lower12)
+    add t2, t2, t3            # t2 = adjusted upper20
+
+    # Build auipc x5, upper20: (upper20 << 12) | 0x297
+    slli t4, t2, 12
+    addi t5, zero, 0x297     # (5 << 7) | 0x17
+    or t4, t4, t5
+    addi t5, s8, 8           # address of word 2 in output buffer
+    sw t4, 0(t5)             # patch auipc
+
+    # Build addi x5, x5, lower12: (lower12 << 20) | 0x00028293
+    slli t4, t1, 20
+    lui t5, 0x00028
+    addi t5, t5, 0x293       # 0x00028293 = addi x5, x5, 0
+    or t4, t4, t5
+    addi t5, s8, 12          # address of word 3 in output buffer
+    sw t4, 0(t5)             # patch addi
 
 # ============================================================================
 # PHASE 4: Output compiled binary via UART

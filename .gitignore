@@ -2,3 +2,5 @@
 tmp/*
 bin/*
 tools/__pycache__
+proofs/__pycache__
+

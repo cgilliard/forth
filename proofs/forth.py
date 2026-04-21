@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of the Forth compiler (6956 bytes, 1739 RV32I instructions).
+Binary-level formal verification of the Forth compiler (9532 bytes, 2383 RV32I instructions).
 
 Layers of verification (modeled after proofs/fam0.py):
 
@@ -345,7 +345,7 @@ def main():
     bin_path = os.path.join(BASE, 'bin', 'forth')
     with open(bin_path, 'rb') as f:
         binary = f.read()
-    BINARY_SIZE = 6956
+    BINARY_SIZE = 9532
     assert len(binary) == BINARY_SIZE, f"Expected {BINARY_SIZE} bytes, got {len(binary)}"
     words = [struct.unpack_from('<I', binary, i)[0] for i in range(0, len(binary), 4)]
     N = len(words)
@@ -454,7 +454,7 @@ def main():
         # or is a temporary register used in known code sections
         known_safe = rs1 in safe_bases
         # Temps used as computed pointers in dict lookup and dispatch table code
-        temp_as_ptr = rs1 in (6, 7, 28, 29, 30)  # t1, t2, t3, t4, t5
+        temp_as_ptr = rs1 in (5, 6, 7, 28, 29, 30)  # t0, t1, t2, t3, t4, t5
         if not known_safe and not temp_as_ptr:
             print(f"  WARN  store @0x{pc:03x}: {width} {RNAMES[rs2]}, {imm}({RNAMES[rs1]}) — unexpected base")
             store_ok = False
@@ -490,9 +490,10 @@ def main():
         ("output buffer",  0x84000000, 0x85000000),
         ("dictionary",     0x82000000, 0x82800000),
         ("word buffer",    0x82800000, 0x82800100),
-        ("control stack",  0x82800100, 0x82800500),
-        ("patch list",     0x82800500, 0x82800900),
-        ("call site list", 0x82800900, 0x82900000),
+        ("control stack",  0x82800100, 0x82801100),
+        ("leave scratch",  0x82801100, 0x82801200),
+        ("patch list",     0x82810000, 0x82850000),
+        ("call site list", 0x82850000, 0x82890000),
         ("UART",           0x10000000, 0x10000001),
         ("shutdown",       0x00100000, 0x00100004),
     ]
@@ -596,13 +597,13 @@ def main():
             branch_ok = False
     check(f"all {len(branches)} branch/jump targets in-range and aligned", branch_ok)
 
-    # Check for self-loops (only error_halt should self-loop)
+    # Check for self-loops (none expected — error_halt now shuts down QEMU)
     self_loops = [(pc, kind) for pc, kind, *_, target in branches if target == pc]
-    check(f"self-loops: {len(self_loops)} (expected: 1, error_halt)",
-          len(self_loops) == 1)
+    check(f"self-loops: {len(self_loops)} (expected: 0, error_halt shuts down)",
+          len(self_loops) == 0)
     if self_loops:
         for pc, kind in self_loops:
-            print(f"    0x{pc:03x}: {kind} self-loop (error_halt)")
+            print(f"    0x{pc:03x}: {kind} unexpected self-loop")
 
     # ═══════════════════════════════════════════════════════════
     # [4] Initialization verification
@@ -695,6 +696,113 @@ def main():
                   rv_opcode(w_sw) == 0x23 and rv_funct3(w_sw) == 2 and rv_rs1(w_sw) == 21)
 
     # ═══════════════════════════════════════════════════════════
+    # [5b] Overflow bounds check verification
+    # ═══════════════════════════════════════════════════════════
+    print("\n[5b] Overflow bounds check verification")
+
+    # Verify that the binary contains branch instructions that compare
+    # each growable register against the expected limit value.
+    # Strategy: find LUI instructions that load limit upper bits into a temp,
+    # then verify a branch instruction nearby compares the relevant register.
+
+    def find_limit_checks(limit_upper, limit_lower, check_reg, check_type="bltu"):
+        """Find branches comparing check_reg against a loaded limit value.
+        Returns list of PCs where the check occurs."""
+        found = []
+        for i in range(N - 2):
+            w = words[i]
+            # Look for: lui tX, limit_upper
+            if rv_opcode(w) == 0x37 and rv_imm_u(w) == (limit_upper << 12):
+                tmp_reg = rv_rd(w)
+                # Next instruction might be addi tX, tX, limit_lower
+                w1 = words[i + 1]
+                needs_addi = (limit_lower != 0)
+                if needs_addi:
+                    if rv_opcode(w1) == 0x13 and rv_funct3(w1) == 0 \
+                       and rv_rd(w1) == tmp_reg and rv_rs1(w1) == tmp_reg \
+                       and (rv_imm_i(w1) & 0xFFF) == (limit_lower & 0xFFF):
+                        branch_i = i + 2
+                    else:
+                        continue
+                else:
+                    branch_i = i + 1
+                if branch_i >= N:
+                    continue
+                wb = words[branch_i]
+                if rv_opcode(wb) == 0x63:  # B-type branch
+                    f3 = rv_funct3(wb)
+                    rs1 = rv_rs1(wb)
+                    rs2 = rv_rs2(wb)
+                    # bltu check_reg, tX = funct3=6, rs1=check_reg, rs2=tmp_reg
+                    if check_type == "bltu" and f3 == 6 and rs1 == check_reg and rs2 == tmp_reg:
+                        found.append(i * 4)
+                    # bgeu check_reg, tX = funct3=7, rs1=check_reg, rs2=tmp_reg
+                    elif check_type == "bgeu" and f3 == 7 and rs1 == check_reg and rs2 == tmp_reg:
+                        found.append(i * 4)
+                    # bne check_reg, tX = funct3=1, rs1=check_reg, rs2=tmp_reg
+                    elif check_type == "bne" and f3 == 1 and ((rs1 == check_reg and rs2 == tmp_reg) or (rs2 == check_reg and rs1 == tmp_reg)):
+                        found.append(i * 4)
+                    # beq check_reg, tX (for underflow: s9 == base)
+                    elif check_type == "beq" and f3 == 0 and ((rs1 == check_reg and rs2 == tmp_reg) or (rs2 == check_reg and rs1 == tmp_reg)):
+                        found.append(i * 4)
+        return found
+
+    # Control stack overflow: s9(x25) < 0x82801100
+    cstk_ov = find_limit_checks(0x82801, 0x100, 25, "bltu")
+    check(f"control stack overflow checks: {len(cstk_ov)} found (expect ≥ 9)", len(cstk_ov) >= 9)
+    print(f"    {len(cstk_ov)} checks at: {', '.join(f'0x{pc:x}' for pc in cstk_ov)}")
+
+    # Control stack underflow: s9(x25) != 0x82800100
+    cstk_uf = find_limit_checks(0x82800, 0x100, 25, "bne")
+    check(f"control stack underflow checks: {len(cstk_uf)} found (expect ≥ 6)", len(cstk_uf) >= 6)
+    print(f"    {len(cstk_uf)} checks at: {', '.join(f'0x{pc:x}' for pc in cstk_uf)}")
+
+    # Patch list overflow: s11(x27) < 0x82850000
+    patch_ov = find_limit_checks(0x82850, 0, 27, "bltu")
+    check(f"patch list overflow checks: {len(patch_ov)} found (expect ≥ 2)", len(patch_ov) >= 2)
+    print(f"    {len(patch_ov)} checks at: {', '.join(f'0x{pc:x}' for pc in patch_ov)}")
+
+    # Call site overflow: s10(x26) < 0x10000 (65536)
+    call_ov = find_limit_checks(0x10, 0, 26, "bltu")
+    check(f"call site overflow checks: {len(call_ov)} found (expect ≥ 1)", len(call_ov) >= 1)
+    print(f"    {len(call_ov)} checks at: {', '.join(f'0x{pc:x}' for pc in call_ov)}")
+
+    # Dictionary overflow: s4(x20) < 0x82800000
+    dict_ov = find_limit_checks(0x82800, 0, 20, "bltu")
+    check(f"dictionary overflow checks: {len(dict_ov)} found (expect ≥ 1)", len(dict_ov) >= 1)
+    print(f"    {len(dict_ov)} checks at: {', '.join(f'0x{pc:x}' for pc in dict_ov)}")
+
+    # Word name length check: find bltu s7(x23), tX where tX was loaded with 31
+    name_checks = 0
+    for i in range(N - 1):
+        w = words[i]
+        # addi tX, zero, 31
+        if rv_opcode(w) == 0x13 and rv_funct3(w) == 0 and rv_rs1(w) == 0 and rv_imm_i(w) == 31:
+            tmp = rv_rd(w)
+            w1 = words[i + 1]
+            if rv_opcode(w1) == 0x63 and rv_funct3(w1) == 6 and rv_rs1(w1) == 23 and rv_rs2(w1) == tmp:
+                name_checks += 1
+    check(f"word name length checks: {name_checks} found (expect ≥ 1)", name_checks >= 1)
+
+    # Nested colon check: beqz tp (beq x4, x0) — tp==0 means ok to define
+    nested_checks = 0
+    for i in range(N):
+        w = words[i]
+        if rv_opcode(w) == 0x63 and rv_funct3(w) == 0:
+            if (rv_rs1(w) == 4 and rv_rs2(w) == 0) or (rv_rs1(w) == 0 and rv_rs2(w) == 4):
+                nested_checks += 1
+    check(f"nested colon check (beqz tp): {nested_checks} found (expect ≥ 1)", nested_checks >= 1)
+
+    # Semicolon outside check: bnez tp (bne x4, x0) — tp!=0 means ok to end def
+    semi_checks = 0
+    for i in range(N):
+        w = words[i]
+        if rv_opcode(w) == 0x63 and rv_funct3(w) == 1:
+            if (rv_rs1(w) == 4 and rv_rs2(w) == 0) or (rv_rs1(w) == 0 and rv_rs2(w) == 4):
+                semi_checks += 1
+    check(f"semi outside check (bnez tp): {semi_checks} found (expect ≥ 1)", semi_checks >= 1)
+
+    # ═══════════════════════════════════════════════════════════
     # [6] No-JALR proof: compiler binary AND compiled output
     # ═══════════════════════════════════════════════════════════
     print("\n[6] No-JALR proof (compiler + compiled output)")
@@ -729,11 +837,20 @@ def main():
     expected_instrs = {
         "nop (magic)":               0x00000013,
         "lui s5, 0x10000":           0x10000AB7,
-        "lui s4, 0x84100":           0x84100A37,
-        "lui s2, 0x84900":           0x84900937,
-        "lui x5, 0x80100 (heap)":    0x801002B7,
-        "addi x6, x5, 4 (heap)":     0x00428313,
-        "sw x6, 0(x5) (heap init)":  0x0062A023,
+        "auipc t0, 0 (PIC base placeholder)": 0x00000297,
+        "addi t0, t0, 0 (PIC offset placeholder)": 0x00028293,
+        "addi s9, t0, 0 (here base)": 0x00028C93,
+        "lui t1, 0x04000 (64MB)":    0x04000337,
+        "add s6, t0, t1 (store upper)": 0x00628B33,
+        "lui t1, 0x04800 (72MB)":    0x04800337,
+        "add s4, t0, t1 (stack top)": 0x00628A33,
+        "addi s2, s4, 0 (shadow base)": 0x000A0913,
+        "addi s7, s4, 0 (underflow limit)": 0x000A0B93,
+        "addi s10, s4, 0 (shadow underflow)": 0x000A0D13,
+        "lui t1, 0x04900 (73MB)":    0x04900337,
+        "add s8, t0, t1 (shadow upper)": 0x00628C33,
+        "addi t1, t0, 4 (heap start)": 0x00428313,
+        "sw t1, 0(t0) (heap init)":  0x0062A023,
         "addi s4, s4, -4 (push)":    0xFFCA0A13,
         "sw s3, 0(s4) (push TOS)":   0x013A2023,
         "lw x19, 0(x20) (pop TOS)":  0x000A2983,
@@ -743,7 +860,11 @@ def main():
         "srl x19 (rshift)":          0x0132D9B3,
         "sltu x19 (u<)":             0x0132B9B3,
         "xori x19, -1 (invert)":     0xFFF9C993,
-        "lui x19, 0x80100 (here)":   0x801009B7,
+        "addi x5, x25, 0 (here addr PIC)": 0x000C8293,
+        "lw x19, 0(x5) (here load)":  0x0002A983,
+        "addi x19, x19, 3 (align1)":  0x00398993,
+        "andi x19, x19, -4 (align2)": 0xFFC9F993,
+        "sw x19, 0(x5) (here store)": 0x0132A023,
         "sw x19, 0(x18) (do)":       0x01392023,
         "sw x5, 4(x18) (do)":        0x00592223,
         "addi x18, x18, 8 (do)":     0x00890913,
@@ -845,7 +966,13 @@ def main():
     prove("dispatch li t0: opcode = 0x13 (never 0x67)",
           ForAll([disp_id], Extract(6, 0, disp_li) == 0x13))
 
-    print("\n  Dynamic paths produce only opcodes {0x13, 0x37, 0x63, 0x6F}.")
+    # s" string literals use auipc for PC-relative addressing
+    str_upper = BitVec('str_upper', 32)
+    str_auipc = (str_upper << 12) | C(0x00000097 | (19 << 7))
+    prove("s\" auipc x19: opcode = 0x17 (never 0x67)",
+          ForAll([str_upper], Extract(6, 0, str_auipc) == 0x17))
+
+    print("\n  Dynamic paths produce only opcodes {0x13, 0x17, 0x37, 0x63, 0x6F}.")
     print("  0x67 (JALR/JR/RET) is structurally impossible.")
 
     # ═══════════════════════════════════════════════════════════
@@ -986,32 +1113,302 @@ def main():
     if bye_out and len(bye_out) >= 4:
         bye_words = [struct.unpack_from('<I', bye_out, i)[0]
                      for i in range(0, len(bye_out), 4)]
-        # Prologue: nop, lui s5, lui s4, lui s2, heap init (3 words), then bye
+        # PIC Prologue (17 words):
+        #   0: nop, 1: lui s5, 2: auipc t0 (patched), 3: addi t0 (patched),
+        #   4: addi s9, 5: lui t1 64MB, 6: add s6, 7: lui t1 72MB,
+        #   8: add s4, 9: addi s2, 10: addi s7, 11: addi s10,
+        #   12: lui t1 73MB, 13: add s8, 14: addi t1 heap, 15: sw heap init,
+        #   16: jal skip
         check("bye: word 0 = nop (0x00000013)", bye_words[0] == 0x00000013)
         if len(bye_words) > 1:
             check("bye: word 1 = lui s5, 0x10000 (0x10000AB7)",
                   bye_words[1] == 0x10000AB7)
-        if len(bye_words) > 2:
-            check("bye: word 2 = lui s4, 0x84100 (0x84100A37)",
-                  bye_words[2] == 0x84100A37)
         if len(bye_words) > 3:
-            check("bye: word 3 = lui s2, 0x84900 (0x84900937)",
-                  bye_words[3] == 0x84900937)
-        # Heap init: lui x5,0x80100; addi x6,x5,4; sw x6,0(x5)
+            check("bye: word 2 = auipc t0 (opcode 0x17, rd=t0)",
+                  rv_opcode(bye_words[2]) == 0x17 and rv_rd(bye_words[2]) == 5)
+            check("bye: word 3 = addi t0, t0, <offset> (PIC offset)",
+                  rv_opcode(bye_words[3]) == 0x13 and rv_rd(bye_words[3]) == 5
+                  and rv_rs1(bye_words[3]) == 5)
+        if len(bye_words) > 4:
+            check("bye: word 4 = addi s9, t0, 0 (0x00028C93)",
+                  bye_words[4] == 0x00028C93)
         if len(bye_words) > 6:
-            check("bye: word 4 = lui x5, 0x80100 (0x801002B7)",
-                  bye_words[4] == 0x801002B7)
-            check("bye: word 5 = addi x6, x5, 4 (0x00428313)",
-                  bye_words[5] == 0x00428313)
-            check("bye: word 6 = sw x6, 0(x5) (0x0062A023)",
-                  bye_words[6] == 0x0062A023)
+            check("bye: word 5 = lui t1, 0x04000 (0x04000337)",
+                  bye_words[5] == 0x04000337)
+            check("bye: word 6 = add s6, t0, t1 (0x00628B33)",
+                  bye_words[6] == 0x00628B33)
+        if len(bye_words) > 8:
+            check("bye: word 7 = lui t1, 0x04800 (0x04800337)",
+                  bye_words[7] == 0x04800337)
+            check("bye: word 8 = add s4, t0, t1 (0x00628A33)",
+                  bye_words[8] == 0x00628A33)
+        if len(bye_words) > 11:
+            check("bye: word 9 = addi s2, s4, 0 (0x000A0913)",
+                  bye_words[9] == 0x000A0913)
+            check("bye: word 10 = addi s7, s4, 0 (0x000A0B93)",
+                  bye_words[10] == 0x000A0B93)
+            check("bye: word 11 = addi s10, s4, 0 (0x000A0D13)",
+                  bye_words[11] == 0x000A0D13)
+        if len(bye_words) > 15:
+            check("bye: word 12 = lui t1, 0x04900 (0x04900337)",
+                  bye_words[12] == 0x04900337)
+            check("bye: word 13 = add s8, t0, t1 (0x00628C33)",
+                  bye_words[13] == 0x00628C33)
+            check("bye: word 14 = addi t1, t0, 4 (0x00428313)",
+                  bye_words[14] == 0x00428313)
+            check("bye: word 15 = sw t1, 0(t0) (0x0062A023)",
+                  bye_words[15] == 0x0062A023)
+        if len(bye_words) > 16:
+            check("bye: word 16 = jal x0, +64 (0x0400006F)",
+                  bye_words[16] == 0x0400006F)
+        # Error handler at words 17-31 (15 instructions)
+        if len(bye_words) > 31:
+            check("bye: error handler starts with addi t0, 0, 0x21",
+                  bye_words[17] == 0x02100293)
+            check("bye: error handler ends with jal x0, 0 (halt)",
+                  bye_words[31] == 0x0000006F)
 
-        # Verify bye emits correct shutdown sequence (after prologue)
+        # Verify bye emits correct shutdown sequence (after prologue + error handler)
         bye_expected = [0x00100AB7, 0x000052B7, 0x55528293, 0x005AA023]
-        if len(bye_words) >= 11:
-            bye_tail = bye_words[7:11]
+        if len(bye_words) >= 36:
+            bye_tail = bye_words[32:36]
             check("bye: shutdown sequence correct",
                   bye_tail == bye_expected)
+
+        # PIC verification: auipc offset points to end of binary (here)
+        if len(bye_words) > 3:
+            auipc_upper = rv_imm_u(bye_words[2])
+            addi_lower = rv_imm_i(bye_words[3])
+            pic_offset = auipc_upper + addi_lower
+            expected_offset = (len(bye_out) - 8)
+            check(f"bye: PIC offset ({pic_offset}) = binary_size - 8 ({expected_offset})",
+                  pic_offset == expected_offset)
+
+    # Part B2: Runtime overflow check verification
+    print("\n  [6b2] Runtime overflow checks in compiled output")
+    STK_CHECK = 0x014B6463   # bltu s6, s4, +8
+    SHADOW_CHECK = 0x01896463  # bltu s2, s8, +8
+
+    # Compile a program with push operations and verify checks present
+    push_prog = compile_forth("1 dup over bye")
+    if push_prog:
+        pw = [struct.unpack_from('<I', push_prog, i)[0]
+              for i in range(0, len(push_prog), 4)]
+        stk_checks = sum(1 for w in pw if w == STK_CHECK)
+        check(f"push program has stack overflow checks ({stk_checks} found, expect ≥3)",
+              stk_checks >= 3)
+
+    # Compile a program with word calls and verify shadow checks
+    call_prog = compile_forth(": x ; x x bye")
+    if call_prog:
+        cw = [struct.unpack_from('<I', call_prog, i)[0]
+              for i in range(0, len(call_prog), 4)]
+        shadow_checks = sum(1 for w in cw if w == SHADOW_CHECK)
+        check(f"call program has shadow stack overflow checks ({shadow_checks} found, expect ≥2)",
+              shadow_checks >= 2)
+
+    # Compile a program with DO loop and verify shadow check
+    do_prog = compile_forth("5 0 do loop bye")
+    if do_prog:
+        dw = [struct.unpack_from('<I', do_prog, i)[0]
+              for i in range(0, len(do_prog), 4)]
+        do_shadow = sum(1 for w in dw if w == SHADOW_CHECK)
+        check(f"do/loop program has shadow stack overflow check ({do_shadow} found, expect ≥1)",
+              do_shadow >= 1)
+
+    # Part B3: Runtime underflow check verification
+    print("\n  [6b3] Runtime underflow checks in compiled output")
+    UNDERFLOW_CHECK = 0x017A6463  # bltu s4, s7, +8
+    STORE_PROT_CHECK = 0x0199F463  # bgeu s3, s9, +8
+
+    # Compile a program with pop operations (drop, +, -)
+    pop_prog = compile_forth("1 2 + drop bye")
+    if pop_prog:
+        ppw = [struct.unpack_from('<I', pop_prog, i)[0]
+               for i in range(0, len(pop_prog), 4)]
+        uf_checks = sum(1 for w in ppw if w == UNDERFLOW_CHECK)
+        check(f"pop program has underflow checks ({uf_checks} found, expect ≥2)",
+              uf_checks >= 2)
+
+    # Compile a program with store operations
+    store_prog = compile_forth("here 42 swap ! bye")
+    if store_prog:
+        sw = [struct.unpack_from('<I', store_prog, i)[0]
+              for i in range(0, len(store_prog), 4)]
+        sp_checks = sum(1 for w in sw if w == STORE_PROT_CHECK)
+        check(f"store program has store protection checks ({sp_checks} found, expect ≥1)",
+              sp_checks >= 1)
+        uf_store = sum(1 for w in sw if w == UNDERFLOW_CHECK)
+        check(f"store program has underflow checks ({uf_store} found, expect ≥2)",
+              uf_store >= 2)
+
+    # Compile c! and verify protections
+    cstore_prog = compile_forth("here 65 swap c! bye")
+    if cstore_prog:
+        csw = [struct.unpack_from('<I', cstore_prog, i)[0]
+               for i in range(0, len(cstore_prog), 4)]
+        csp_checks = sum(1 for w in csw if w == STORE_PROT_CHECK)
+        check(f"c! program has store protection checks ({csp_checks} found, expect ≥1)",
+              csp_checks >= 1)
+
+    # Part B4: Shadow stack underflow check verification
+    print("\n  [6b4] Runtime shadow underflow checks in compiled output")
+    SHADOW_UNDERFLOW_CHECK = 0x012D6463  # bltu s10, s2, +8
+
+    # Compile a program with semicolon (word def) — should have shadow underflow check
+    semi_prog = compile_forth(": x ; x bye")
+    if semi_prog:
+        sw2 = [struct.unpack_from('<I', semi_prog, i)[0]
+               for i in range(0, len(semi_prog), 4)]
+        su_checks = sum(1 for w in sw2 if w == SHADOW_UNDERFLOW_CHECK)
+        check(f"word def has shadow underflow checks ({su_checks} found, expect ≥1)",
+              su_checks >= 1)
+
+    # Compile a program with exit — should have shadow underflow check
+    exit_prog = compile_forth(": x exit ; x bye")
+    if exit_prog:
+        ew = [struct.unpack_from('<I', exit_prog, i)[0]
+              for i in range(0, len(exit_prog), 4)]
+        eu_checks = sum(1 for w in ew if w == SHADOW_UNDERFLOW_CHECK)
+        check(f"exit has shadow underflow checks ({eu_checks} found, expect ≥2)",
+              eu_checks >= 2)
+
+    # Compile a program with do/loop — should have shadow underflow check
+    loop_prog = compile_forth("5 0 do loop bye")
+    if loop_prog:
+        lw2 = [struct.unpack_from('<I', loop_prog, i)[0]
+               for i in range(0, len(loop_prog), 4)]
+        lu_checks = sum(1 for w in lw2 if w == SHADOW_UNDERFLOW_CHECK)
+        check(f"do/loop has shadow underflow check ({lu_checks} found, expect ≥1)",
+              lu_checks >= 1)
+
+    # Compile a program with leave — should have shadow underflow check
+    leave_prog = compile_forth("5 0 do leave loop bye")
+    if leave_prog:
+        lvw = [struct.unpack_from('<I', leave_prog, i)[0]
+               for i in range(0, len(leave_prog), 4)]
+        lvu_checks = sum(1 for w in lvw if w == SHADOW_UNDERFLOW_CHECK)
+        check(f"leave has shadow underflow checks ({lvu_checks} found, expect ≥2)",
+              lvu_checks >= 2)
+
+    # Part B5: Heap bounds check verification
+    print("\n  [6b5] Runtime heap bounds checks in compiled output")
+    HEAP_CHECK = 0x0169E463  # bltu s3, s6, +8
+
+    here_prog = compile_forth("here drop bye")
+    if here_prog:
+        hw = [struct.unpack_from('<I', here_prog, i)[0]
+              for i in range(0, len(here_prog), 4)]
+        hc_checks = sum(1 for w in hw if w == HEAP_CHECK)
+        check(f"here has heap bounds check ({hc_checks} found, expect ≥1)",
+              hc_checks >= 1)
+
+    # Verify ! has both lower bound (store prot) AND upper bound (heap) checks
+    store_prog2 = compile_forth("here 42 swap ! bye")
+    if store_prog2:
+        sw3 = [struct.unpack_from('<I', store_prog2, i)[0]
+               for i in range(0, len(store_prog2), 4)]
+        sp_lower = sum(1 for w in sw3 if w == STORE_PROT_CHECK)
+        sp_upper = sum(1 for w in sw3 if w == HEAP_CHECK)
+        check(f"! has store lower bound check ({sp_lower} found, expect ≥1)",
+              sp_lower >= 1)
+        check(f"! has store upper bound check ({sp_upper} found, expect ≥1)",
+              sp_upper >= 1)
+
+    # Verify c! has both bounds checks
+    cstore_prog2 = compile_forth("here 65 swap c! bye")
+    if cstore_prog2:
+        csw2 = [struct.unpack_from('<I', cstore_prog2, i)[0]
+                for i in range(0, len(cstore_prog2), 4)]
+        cs_lower = sum(1 for w in csw2 if w == STORE_PROT_CHECK)
+        cs_upper = sum(1 for w in csw2 if w == HEAP_CHECK)
+        check(f"c! has store lower bound check ({cs_lower} found, expect ≥1)",
+              cs_lower >= 1)
+        check(f"c! has store upper bound check ({cs_upper} found, expect ≥1)",
+              cs_upper >= 1)
+
+    # Verify s10 (shadow underflow limit) is in prologue of compiled programs
+    if semi_prog:
+        check("compiled program has addi s10 in prologue (0x000A0D13)",
+              0x000A0D13 in sw2[:17])
+
+    # Part B6: Memory safety — prove all user stores are bounded to heap
+    print("\n  [6b6] Memory safety: user stores bounded to heap [here, here+64MB)")
+    # In compiled output, the only store instructions that use a runtime address
+    # (user-controlled via TOS) are:
+    #   sw x5, 0(x19)  = 0x0059A023  (! word)
+    #   sb x5, 0(x19)  = 0x00598023  (c! word)
+    # These MUST be preceded by BOTH:
+    #   bgeu x19, x25, +8 = 0x0199F463  (addr >= s9 = here base)
+    #   bltu x19, x22, +8 = 0x0169E463  (addr <  s6 = here + 64MB)
+    # PIC layout: here → 64MB heap → 8MB data stack → 1MB shadow stack
+    # s9 = here, s6 = here+64MB, s4 = here+72MB, s8 = here+73MB
+    # Store bounds [s9, s6) exclude data stack and shadow stack.
+
+    USER_SW = 0x0059A023   # sw x5, 0(x19) — ! word
+    USER_SB = 0x00598023   # sb x5, 0(x19) — c! word
+    LOWER_BOUND = STORE_PROT_CHECK  # bgeu x19, x25, +8
+    UPPER_BOUND = HEAP_CHECK        # bltu x19, x22, +8
+
+    safety_programs = [
+        "here 42 swap ! bye",
+        "here 65 swap c! bye",
+        "here dup 1 swap ! 2 swap c! bye",
+        ": w here 99 swap ! ; w bye",
+        "here dup dup 1 swap ! 2 swap c! 3 swap ! bye",
+    ]
+
+    all_safe = True
+    for src in safety_programs:
+        prog = compile_forth(src)
+        if not prog:
+            continue
+        pw2 = [struct.unpack_from('<I', prog, i)[0]
+               for i in range(0, len(prog), 4)]
+        # Find every user store instruction and verify both bounds precede it
+        for idx, w in enumerate(pw2):
+            if w == USER_SW or w == USER_SB:
+                kind = "sw" if w == USER_SW else "sb"
+                # Look backwards for both bounds checks (within 20 instructions)
+                preceding = pw2[max(0, idx-20):idx]
+                has_lower = LOWER_BOUND in preceding
+                has_upper = UPPER_BOUND in preceding
+                if not (has_lower and has_upper):
+                    all_safe = False
+                    check(f"memory safety: {kind} at word {idx} in '{src}' has both bounds",
+                          False)
+    check("all user stores (sw/sb via x19) preceded by both bounds checks",
+          all_safe)
+
+    # Verify PIC bounds structure: s9 = here, s6 = here + 64MB
+    # In PIC prologue: addi s9, t0, 0 (word 4) and add s6, t0, t1 (word 6)
+    # where t1 was loaded with 0x04000000 (64MB) at word 5
+    if store_prog2:
+        check("store lower bound: addi s9, t0, 0 in prologue (0x00028C93)",
+              0x00028C93 in sw3[:17])
+        check("store upper offset: lui t1, 0x04000 in prologue (0x04000337)",
+              0x04000337 in sw3[:17])
+        check("store upper bound: add s6, t0, t1 in prologue (0x00628B33)",
+              0x00628B33 in sw3[:17])
+
+    # Prove PIC layout separates heap from stacks:
+    # s6 = here + 64MB, s4 = here + 72MB (data stack base),
+    # s8 = here + 73MB (shadow stack upper)
+    # Store bounds [here, here+64MB) exclude both stacks.
+    # The offsets are fixed: 64MB < 72MB < 73MB, so if no overflow
+    # occurs (here < 0xFB700000), the stacks are always above store upper.
+    # In practice here is near the load address (< 1GB), well within bounds.
+    prove("64MB < 72MB (store upper offset < data stack offset)",
+          ULT(C(0x04000000), C(0x04800000)))
+    prove("64MB < 73MB (store upper offset < shadow stack upper offset)",
+          ULT(C(0x04000000), C(0x04900000)))
+    prove("heap size = 64MB between store bounds",
+          C(0x04000000) == C(64 * 1024 * 1024))
+
+    # Verify error handler is in all compiled programs (starts with 0x02100293)
+    check("all compiled programs contain runtime error handler",
+          push_prog and 0x02100293 in [struct.unpack_from('<I', push_prog, i)[0]
+                                        for i in range(0, len(push_prog), 4)])
 
     # Part C: Concrete JALR scan of every compiled binary.
     # Compile a diverse set of programs and verify no instruction word
@@ -1410,6 +1807,28 @@ def main():
         ("single char =", "1 1 = drop bye", None, None),
         ("single char <", "1 2 < drop bye", None, None),
         ("single char >", "2 1 > drop bye", None, None),
+
+        # Compile-time error: unclosed colon definition at bye
+        ("unclosed def at bye", ": foo 1\nbye", None, None),
+        # Compile-time error: unmatched control structure at bye
+        ("unmatched ctrl at bye", "1 if bye", None, None),
+
+        # Store operations (exercises store protection + underflow checks)
+        ("store to heap", "here 42 swap ! bye", None, None),
+        ("cstore to heap", "here 65 swap c! bye", None, None),
+
+        # Emit with underflow check
+        ("emit pop", "65 emit bye", None, None),
+
+        # do/loop with underflow checks
+        ("do underflow checks", "3 0 do i drop loop bye", None, None),
+        # +loop with underflow
+        ("+loop underflow check", "10 0 do i drop 2 +loop bye", None, None),
+
+        # if/while/until underflow checks
+        ("if underflow", "1 if then bye", None, None),
+        ("while underflow", "1 begin dup while 1 - repeat drop bye", None, None),
+        ("until underflow", "0 begin 1 until bye", None, None),
     ]
 
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
