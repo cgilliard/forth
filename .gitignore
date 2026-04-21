@@ -1,6 +1,7 @@
 **/*.swp
 tmp/*
 bin/*
+demos/*.bin
 tools/__pycache__
 proofs/__pycache__
 

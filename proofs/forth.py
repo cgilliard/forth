@@ -248,7 +248,9 @@ def simulate_forth(binary, input_bytes, max_steps=200_000_000,
             elif addr == uart_base + 5:
                 # Determine if we're in input phase or output phase
                 # Output phase starts after compile_done (near end of binary)
-                in_output = (pc >= (len(binary) - 200))
+                # Error reporter (~0x2284-0x2380) also outputs via UART TX
+                err_reporter = (len(binary) - 800) <= pc < (len(binary) - 200)
+                in_output = (pc >= (len(binary) - 200)) or err_reporter
                 if in_output:
                     cnt = tx_poll_count.get(output_pos, 0)
                     tx_poll_count[output_pos] = cnt + 1
@@ -1829,6 +1831,68 @@ def main():
         ("if underflow", "1 if then bye", None, None),
         ("while underflow", "1 begin dup while 1 - repeat drop bye", None, None),
         ("until underflow", "0 begin 1 until bye", None, None),
+
+        # --- Control stack underflow: bare closers without matching openers ---
+        ("bare then", "then", None, None),
+        ("bare else", "else", None, None),
+        ("bare until", "until", None, None),
+        ("bare repeat", "repeat", None, None),
+        ("begin then bare repeat", "begin repeat", None, None),
+        ("bare loop", "loop", None, None),
+        ("bare +loop", "+loop", None, None),
+        ("bare leave", "leave", None, None),
+
+        # --- Compile-time errors ---
+        ("nested colon", ": foo : bar 1 ;", None, None),
+        ("bare semicolon", ";", None, None),
+        ("word name too long (colon)", ": abcdefghijklmnopqrstuvwxyz1234567 1 ;", None, None),
+        ("word name too long (bare)", "a" * 32, None, None),
+
+        # --- Multi-line paren comment (newline inside parens, exercises line counter) ---
+        ("paren comment with newline", "( line1\nline2 ) bye", None, None),
+
+        # --- Control stack overflow: deeply nested structures (1024+ entries fills 4KB stack) ---
+        ("ctrl stack overflow: nested if",
+         " ".join(["if"] * 1100),
+         None, None),
+        ("ctrl stack overflow: nested begin",
+         " ".join(["begin"] * 1100),
+         None, None),
+        ("ctrl stack overflow: nested do",
+         " ".join(["1 0 do"] * 1100),
+         None, None),
+        ("ctrl stack overflow: nested begin/while",
+         " ".join(["1 begin dup while"] * 600),
+         None, None),
+        ("ctrl stack overflow: many leaves",
+         "1 0 do " + " ".join(["leave"] * 1100),
+         None, None),
+        ("ctrl stack overflow: colon + nested if",
+         ": foo " + " ".join(["if"] * 1100),
+         None, None),
+        # Fill stack with ifs, then trigger specific push sites
+        ("ctrl stack overflow: ifs then do",
+         " ".join(["if"] * 1024) + " 1 0 do",
+         None, None),
+        ("ctrl stack overflow: ifs then colon",
+         " ".join(["if"] * 1024) + " : foo",
+         None, None),
+        ("ctrl stack overflow: begins then while",
+         " ".join(["begin"] * 1024) + " dup while",
+         None, None),
+
+        # --- Compile error on line >= 10 (exercises multi-digit line number printing) ---
+        ("error on line 12",
+         "\n" * 11 + "badword",
+         None, None),
+
+        # --- Compile error with TX delays (exercises UART TX ready polls in error reporter) ---
+        ("error with TX delay",
+         "badword",
+         None, set(range(10))),
+        ("error on line 12 with TX delay",
+         "\n" * 11 + "badword",
+         None, set(range(20))),
     ]
 
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
