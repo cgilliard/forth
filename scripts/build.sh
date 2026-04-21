@@ -41,4 +41,6 @@ run() {
 run fam0.seed src/fam0.fam0 > bin/fam0
 cmp ./bin/fam0 ./fam0.seed || { echo "fam0: binaries don't match!"; exit 1; }
 
+run bin/fam0 src/forth.fam0 > bin/forth
+
 echo "Success!"
