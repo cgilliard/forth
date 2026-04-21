@@ -32,8 +32,13 @@
 #   0x82800900           = call site list (target addresses for dispatch table)
 #   0x83000000           = input buffer (source code)
 #   0x84000000           = output buffer (compiled binary)
-#   0x85000000           = data stack base (compiled program, grows down)
-#   0x85800000           = shadow stack base (compiled program, grows up)
+#
+# Compiled program memory map:
+#   0x80000000           = code (grows up, ~1MB reserved)
+#   0x80100000           = heap pointer variable (4 bytes)
+#   0x80100004           = heap start (64 MB, grows up)
+#   0x84100000           = data stack top (8 MB, grows down)
+#   0x84900000           = shadow stack base (grows up)
 
 # ============================================================================
 # PHASE 1: Read all input from UART into input buffer
@@ -92,19 +97,34 @@ read_done:
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # emit: lui s4, 0x85000 (data stack)
-    # instruction = (0x85000 << 12) | (20 << 7) | 0x37
-    # = 0x85000000 | 0xA00 | 0x37 = 0x85000A37
-    lui t0, 0x85001         # 0x85001000 (adjust for negative addi)
-    addi t0, t0, -0x5C9     # 0x85001000 - 0x5C9 = 0x85000A37
+    # emit: lui s4, 0x84100 (data stack top)
+    # = 0x84100A37
+    lui t0, 0x84101         # 0x84101000 (adjust for negative addi)
+    addi t0, t0, -0x5C9     # 0x84101000 - 0x5C9 = 0x84100A37
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # emit: lui s2, 0x85800 (shadow stack)
-    # instruction = (0x85800 << 12) | (18 << 7) | 0x37
-    # = 0x85800000 | 0x900 | 0x37 = 0x85800937
-    lui t0, 0x85801         # 0x85801000
-    addi t0, t0, -0x6C9     # 0x85801000 - 0x6C9 = 0x85800937
+    # emit: lui s2, 0x84900 (shadow stack base)
+    # = 0x84900937
+    lui t0, 0x84901         # 0x84901000
+    addi t0, t0, -0x6C9     # 0x84901000 - 0x6C9 = 0x84900937
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # emit: heap pointer initialization
+    # lui x5, 0x80100       (t0 = 0x80100000) = 0x801002B7
+    lui t0, 0x80100
+    addi t0, t0, 0x2B7
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x6, x5, 4        (t1 = 0x80100004) = 0x00428313
+    lui t0, 0x00428
+    addi t0, t0, 0x313
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw x6, 0(x5)          (mem[0x80100000] = 0x80100004) = 0x0062A023
+    lui t0, 0x0062A
+    addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
 
@@ -114,7 +134,9 @@ read_done:
 compile_loop:
     # Skip whitespace
 skip_ws:
-    beq s1, s2, compile_done    # end of input?
+    bne s1, s2, skip_ws_cont    # continue if input remains
+    j compile_done              # end of input (needs JAL range)
+skip_ws_cont:
     lbu t0, 0(s1)               # peek at current char
     addi t1, zero, 32           # space
     beq t0, t1, skip_char
@@ -231,6 +253,8 @@ not_semicolon:
     beq t0, t1, emit_lt
     addi t1, zero, 62          # '>'
     beq t0, t1, emit_gt
+    addi t1, zero, 105         # 'i'
+    beq t0, t1, emit_i
     j not_len1
 not_len1:
 
@@ -264,6 +288,18 @@ not_cfetch:
     addi t1, zero, 33          # '!'
     beq t3, t1, emit_cstore
 not_cstore:
+    # "u<" = 'u','<'
+    addi t1, zero, 117         # 'u'
+    bne t0, t1, not_ult2
+    addi t1, zero, 60          # '<'
+    beq t3, t1, emit_ult
+not_ult2:
+    # "do" = 'd','o'
+    addi t1, zero, 100         # 'd'
+    bne t0, t1, not_do2
+    addi t1, zero, 111         # 'o'
+    beq t3, t1, do_do
+not_do2:
     j not_len2
 not_len2:
 
@@ -393,6 +429,36 @@ not_else4:
     addi t1, zero, 116         # 't'
     beq t5, t1, emit_emit
 not_emit4:
+    # "here" = 'h','e','r','e'
+    addi t1, zero, 104         # 'h'
+    bne t0, t1, not_here4
+    addi t1, zero, 101         # 'e'
+    bne t3, t1, not_here4
+    addi t1, zero, 114         # 'r'
+    bne t4, t1, not_here4
+    addi t1, zero, 101         # 'e'
+    beq t5, t1, emit_here
+not_here4:
+    # "exit" = 'e','x','i','t'
+    addi t1, zero, 101         # 'e'
+    bne t0, t1, not_exit4
+    addi t1, zero, 120         # 'x'
+    bne t3, t1, not_exit4
+    addi t1, zero, 105         # 'i'
+    bne t4, t1, not_exit4
+    addi t1, zero, 116         # 't'
+    beq t5, t1, do_exit
+not_exit4:
+    # "loop" = 'l','o','o','p'
+    addi t1, zero, 108         # 'l'
+    bne t0, t1, not_loop4
+    addi t1, zero, 111         # 'o'
+    bne t3, t1, not_loop4
+    addi t1, zero, 111         # 'o'
+    bne t4, t1, not_loop4
+    addi t1, zero, 112         # 'p'
+    beq t5, t1, do_loop
+not_loop4:
     j not_len4
 not_len4:
 
@@ -407,6 +473,9 @@ not_len4:
     # "until" starts with 'u'
     addi t1, zero, 117         # 'u'
     beq t0, t1, check_until
+    # "while" starts with 'w'
+    addi t1, zero, 119         # 'w'
+    beq t0, t1, check_while
     j not_len5
 
 check_begin:
@@ -438,7 +507,134 @@ check_until:
     addi t1, zero, 108         # 'l'
     beq t3, t1, do_until
     j not_len5
+
+check_while:
+    lbu t3, 1(s6)
+    addi t1, zero, 104         # 'h'
+    bne t3, t1, not_len5
+    lbu t3, 2(s6)
+    addi t1, zero, 105         # 'i'
+    bne t3, t1, not_len5
+    lbu t3, 3(s6)
+    addi t1, zero, 108         # 'l'
+    bne t3, t1, not_len5
+    lbu t3, 4(s6)
+    addi t1, zero, 101         # 'e'
+    beq t3, t1, do_while
+    j not_len5
 not_len5:
+
+    # Six-char words (length 6)
+    addi t1, zero, 6
+    bne s7, t1, not_len6
+    lbu t0, 0(s6)
+
+    # "lshift" starts with 'l'
+    addi t1, zero, 108         # 'l'
+    beq t0, t1, check_lshift
+    # "rshift"/"repeat" start with 'r'
+    addi t1, zero, 114         # 'r'
+    beq t0, t1, check_r_len6
+    # "invert" starts with 'i'
+    addi t1, zero, 105         # 'i'
+    beq t0, t1, check_invert
+    # "negate" starts with 'n'
+    addi t1, zero, 110         # 'n'
+    beq t0, t1, check_negate
+    j not_len6
+
+check_lshift:
+    lbu t3, 1(s6)
+    addi t1, zero, 115         # 's'
+    bne t3, t1, not_len6
+    lbu t3, 2(s6)
+    addi t1, zero, 104         # 'h'
+    bne t3, t1, not_len6
+    lbu t3, 3(s6)
+    addi t1, zero, 105         # 'i'
+    bne t3, t1, not_len6
+    lbu t3, 4(s6)
+    addi t1, zero, 102         # 'f'
+    bne t3, t1, not_len6
+    lbu t3, 5(s6)
+    addi t1, zero, 116         # 't'
+    beq t3, t1, emit_lshift
+    j not_len6
+
+check_r_len6:
+    lbu t3, 1(s6)
+    addi t1, zero, 115         # 's' for rshift
+    beq t3, t1, check_rshift_rest
+    addi t1, zero, 101         # 'e' for repeat
+    beq t3, t1, check_repeat_rest
+    j not_len6
+
+check_rshift_rest:
+    lbu t3, 2(s6)
+    addi t1, zero, 104         # 'h'
+    bne t3, t1, not_len6
+    lbu t3, 3(s6)
+    addi t1, zero, 105         # 'i'
+    bne t3, t1, not_len6
+    lbu t3, 4(s6)
+    addi t1, zero, 102         # 'f'
+    bne t3, t1, not_len6
+    lbu t3, 5(s6)
+    addi t1, zero, 116         # 't'
+    beq t3, t1, emit_rshift
+    j not_len6
+
+check_repeat_rest:
+    lbu t3, 2(s6)
+    addi t1, zero, 112         # 'p'
+    bne t3, t1, not_len6
+    lbu t3, 3(s6)
+    addi t1, zero, 101         # 'e'
+    bne t3, t1, not_len6
+    lbu t3, 4(s6)
+    addi t1, zero, 97          # 'a'
+    bne t3, t1, not_len6
+    lbu t3, 5(s6)
+    addi t1, zero, 116         # 't'
+    beq t3, t1, do_repeat
+    j not_len6
+
+check_invert:
+    lbu t3, 1(s6)
+    addi t1, zero, 110         # 'n'
+    bne t3, t1, not_len6
+    lbu t3, 2(s6)
+    addi t1, zero, 118         # 'v'
+    bne t3, t1, not_len6
+    lbu t3, 3(s6)
+    addi t1, zero, 101         # 'e'
+    bne t3, t1, not_len6
+    lbu t3, 4(s6)
+    addi t1, zero, 114         # 'r'
+    bne t3, t1, not_len6
+    lbu t3, 5(s6)
+    addi t1, zero, 116         # 't'
+    beq t3, t1, emit_invert
+    j not_len6
+
+check_negate:
+    lbu t3, 1(s6)
+    addi t1, zero, 101         # 'e'
+    bne t3, t1, not_len6
+    lbu t3, 2(s6)
+    addi t1, zero, 103         # 'g'
+    bne t3, t1, not_len6
+    lbu t3, 3(s6)
+    addi t1, zero, 97          # 'a'
+    bne t3, t1, not_len6
+    lbu t3, 4(s6)
+    addi t1, zero, 116         # 't'
+    bne t3, t1, not_len6
+    lbu t3, 5(s6)
+    addi t1, zero, 101         # 'e'
+    beq t3, t1, emit_negate
+    j not_len6
+not_len6:
 
     # --- Dictionary lookup ---
     j dict_lookup
@@ -839,6 +1035,120 @@ emit_cstore:
     addi s3, s3, 4
     j compile_loop
 
+# --- u< (unsigned less than) ---
+# lw   t0, 0(s4)
+# addi s4, s4, 4
+# sltu s3, t0, s3     s3 = 1 if second <u TOS
+# neg  s3, s3         s3 = -1 or 0
+emit_ult:
+    # lw x5, 0(x20): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sltu x19, x5, x19: 0x0132B9B3
+    lui t0, 0x0132C        # bit11 of 9B3=1, +1
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # neg x19, x19: 0x413009B3
+    lui t0, 0x41301        # bit11 of 9B3=1, +1
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- lshift (logical shift left) ---
+# lw   t0, 0(s4)      pop second (value to shift)
+# addi s4, s4, 4
+# sll  s3, t0, s3     TOS = second << TOS
+emit_lshift:
+    # lw x5, 0(x20): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sll x19, x5, x19: 0x013299B3
+    lui t0, 0x0132A        # bit11 of 9B3=1, +1
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- rshift (logical shift right) ---
+# lw   t0, 0(s4)
+# addi s4, s4, 4
+# srl  s3, t0, s3     TOS = second >> TOS (unsigned)
+emit_rshift:
+    # lw x5, 0(x20): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # srl x19, x5, x19: 0x0132D9B3
+    lui t0, 0x0132E        # bit11 of 9B3=1, +1
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- invert (bitwise NOT) ---
+# xori s3, s3, -1
+emit_invert:
+    # xori x19, x19, -1: 0xFFF9C993
+    lui t0, 0xFFF9D        # bit11 of 993=1, +1
+    addi t0, t0, -0x66D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- negate (arithmetic negate) ---
+# sub  s3, x0, s3
+emit_negate:
+    # sub x19, x0, x19: 0x413009B3
+    lui t0, 0x41301        # bit11 of 9B3=1, +1
+    addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- here (push heap pointer address) ---
+# addi s4, s4, -4     push TOS
+# sw   s3, 0(s4)
+# lui  s3, 0x80100    TOS = 0x80100000
+emit_here:
+    # addi x20, x20, -4: 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw x19, 0(x20): 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # lui x19, 0x80100: 0x801009B7
+    lui t0, 0x80101        # bit11 of 9B7=1, +1
+    addi t0, t0, -0x649
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
 # --- emit (send TOS byte to UART, then drop) ---
 # Emits a retry loop:
 #   lbu  t0, 5(s5)        check LSR
@@ -1226,6 +1536,257 @@ do_until:
     addi t6, zero, 0x63
     or t5, t5, t6
     sw t5, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- exit (early return from word) ---
+# Same return sequence as semicolon: pop shadow stack, load ID, jal dispatch
+do_exit:
+    # Emit: addi x18, x18, -4 = 0xFFC90913
+    lui t0, 0xFFC91
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x9, 0(x18) = 0x00092483
+    lui t0, 0x00092
+    addi t0, t0, 0x483
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: jal x0, 0 (placeholder for dispatch)
+    addi t0, zero, 0x6F
+    sw t0, 0(s3)
+    sw s3, 0(s11)
+    addi s11, s11, 4
+    addi s3, s3, 4
+    j compile_loop
+
+# --- while (begin ... cond while ... repeat) ---
+# Same as if: consume TOS, branch-if-zero forward, push beq addr
+do_while:
+    # Emit: addi t0, s3, 0 (mv t0, TOS): 0x00098293
+    lui t0, 0x00098
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw s3, 0(s4): 0x000A2983
+    lui t0, 0x000A3
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi s4, s4, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: beq t0, zero, 0 (placeholder): 0x00028063
+    lui t0, 0x00028
+    addi t0, t0, 0x063
+    sw t0, 0(s3)
+    sw s3, 0(s9)
+    addi s9, s9, 4
+    addi s3, s3, 4
+    j compile_loop
+
+# --- repeat (end of begin/while loop) ---
+# Pop while's beq addr, pop begin addr, emit jal back to begin, patch while's beq
+do_repeat:
+    # Pop while's beq address
+    addi s9, s9, -4
+    lw t2, 0(s9)
+    # Pop begin address
+    addi s9, s9, -4
+    lw t4, 0(s9)
+
+    # Emit: jal x0, <back to begin>
+    sub t3, t4, s3
+    # Encode J-type
+    srli t5, t3, 20
+    andi t5, t5, 1
+    slli t5, t5, 31
+
+    srli t6, t3, 1
+    andi t6, t6, 0x3FF
+    slli t6, t6, 21
+    or t5, t5, t6
+
+    srli t6, t3, 11
+    andi t6, t6, 1
+    slli t6, t6, 20
+    or t5, t5, t6
+
+    srli t6, t3, 12
+    andi t6, t6, 0xFF
+    slli t6, t6, 12
+    or t5, t5, t6
+
+    addi t6, zero, 0x6F
+    or t5, t5, t6
+    sw t5, 0(s3)
+    addi s3, s3, 4
+
+    # Patch while's beq to point here
+    sub t3, s3, t2
+    srli t5, t3, 12
+    andi t5, t5, 1
+    slli t5, t5, 31
+
+    srli t6, t3, 5
+    andi t6, t6, 0x3F
+    slli t6, t6, 25
+    or t5, t5, t6
+
+    lui t6, 0x00028
+    or t5, t5, t6
+
+    srli t6, t3, 1
+    andi t6, t6, 0xF
+    slli t6, t6, 8
+    or t5, t5, t6
+
+    srli t6, t3, 11
+    andi t6, t6, 1
+    slli t6, t6, 7
+    or t5, t5, t6
+
+    addi t6, zero, 0x63
+    or t5, t5, t6
+    sw t5, 0(t2)
+    j compile_loop
+
+# --- do (counted loop start: limit index do ... loop) ---
+# Move TOS (index) and second (limit) to shadow stack, push loop start
+do_do:
+    # Emit: sw x19, 0(x18) — store index at s2
+    # = 0x01392023
+    lui t0, 0x01392
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x5, 0(x20) — load limit
+    # = 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi x20, x20, 4 — pop data stack
+    # = 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: sw x5, 4(x18) — store limit at s2+4
+    # = 0x00592223
+    lui t0, 0x00592
+    addi t0, t0, 0x223
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi x18, x18, 8 — advance shadow stack
+    # = 0x00890913
+    lui t0, 0x00891
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x19, 0(x20) — pop new TOS
+    # = 0x000A2983
+    lui t0, 0x000A3
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi x20, x20, 4 — pop data stack
+    # = 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Push loop body start onto control stack
+    sw s3, 0(s9)
+    addi s9, s9, 4
+    j compile_loop
+
+# --- loop (counted loop end: increment index, branch if not done) ---
+do_loop:
+    # Emit: lw x5, -8(x18) — load index
+    # = 0xFF892283
+    lui t0, 0xFF892
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi x5, x5, 1 — increment
+    # = 0x00128293
+    lui t0, 0x00128
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x6, -4(x18) — load limit
+    # = 0xFFC92303
+    lui t0, 0xFFC92
+    addi t0, t0, 0x303
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: beq x5, x6, +12 — skip to loop exit if done
+    # = 0x00628663
+    lui t0, 0x00628
+    addi t0, t0, 0x663
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: sw x5, -8(x18) — store updated index
+    # = 0xFE592C23
+    lui t0, 0xFE593
+    addi t0, t0, -0x3DD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: jal x0, <back to loop body>
+    addi s9, s9, -4
+    lw t2, 0(s9)
+    sub t3, t2, s3
+    # Encode J-type
+    srli t5, t3, 20
+    andi t5, t5, 1
+    slli t5, t5, 31
+
+    srli t6, t3, 1
+    andi t6, t6, 0x3FF
+    slli t6, t6, 21
+    or t5, t5, t6
+
+    srli t6, t3, 11
+    andi t6, t6, 1
+    slli t6, t6, 20
+    or t5, t5, t6
+
+    srli t6, t3, 12
+    andi t6, t6, 0xFF
+    slli t6, t6, 12
+    or t5, t5, t6
+
+    addi t6, zero, 0x6F
+    or t5, t5, t6
+    sw t5, 0(s3)
+    addi s3, s3, 4
+    # Emit: addi x18, x18, -8 — pop loop params
+    # = 0xFF890913
+    lui t0, 0xFF891
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- i (push loop index onto data stack) ---
+emit_i:
+    # Emit: addi x20, x20, -4 = 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: sw x19, 0(x20) = 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # Emit: lw x19, -8(x18) = 0xFF892983
+    lui t0, 0xFF893
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
     addi s3, s3, 4
     j compile_loop
 

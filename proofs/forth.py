@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of the Forth compiler (3996 bytes, 999 RV32I instructions).
+Binary-level formal verification of the Forth compiler (5556 bytes, 1389 RV32I instructions).
 
 Layers of verification (modeled after proofs/fam0.py):
 
@@ -147,9 +147,11 @@ RNAMES = [
 # ═══════════════════════════════════════════════════════════════
 
 def simulate_forth(binary, input_bytes, max_steps=200_000_000,
-                    rx_delays=None, tx_delays=None):
+                    rx_delays=None, tx_delays=None, log_stores=False):
     """Execute the forth compiler binary instruction-by-instruction.
     Returns (output, branch_log) where branch_log is {pc: set('T','N')}.
+    If log_stores=True, returns (output, branch_log, store_log) where
+    store_log is [(pc, addr, width)] for every store executed.
     rx_delays: set of input positions where first LSR poll returns not-ready.
     tx_delays: set of output positions where first THR poll returns not-ready.
     """
@@ -160,6 +162,7 @@ def simulate_forth(binary, input_bytes, max_steps=200_000_000,
     mem = {}
     output = bytearray()
     branch_log = {}
+    store_log = [] if log_stores else None
     input_pos = 0
     output_pos = 0
     uart_base = 0x10000000
@@ -286,6 +289,9 @@ def simulate_forth(binary, input_bytes, max_steps=200_000_000,
             f3 = rv_funct3(w)
             addr = (regs[rs1_idx] + rv_imm_s(w)) & 0xFFFFFFFF
             val = rs2_v
+            width = {0: 1, 1: 2, 2: 4}.get(f3, 4)
+            if store_log is not None:
+                store_log.append((pc, addr, width))
             if addr == uart_base:
                 output.append(val & 0xFF)
                 output_pos += 1
@@ -325,6 +331,8 @@ def simulate_forth(binary, input_bytes, max_steps=200_000_000,
             break  # self-loop (error_halt or infinite loop)
         pc = next_pc
 
+    if log_stores:
+        return bytes(output), branch_log, store_log
     return bytes(output), branch_log
 
 
@@ -337,7 +345,7 @@ def main():
     bin_path = os.path.join(BASE, 'bin', 'forth')
     with open(bin_path, 'rb') as f:
         binary = f.read()
-    BINARY_SIZE = 3996
+    BINARY_SIZE = 5556
     assert len(binary) == BINARY_SIZE, f"Expected {BINARY_SIZE} bytes, got {len(binary)}"
     words = [struct.unpack_from('<I', binary, i)[0] for i in range(0, len(binary), 4)]
     N = len(words)
@@ -469,6 +477,93 @@ def main():
     out_stores = [(pc, w, rs1, rs2, imm) for pc, w, rs1, rs2, imm in stores if rs1 == 19]
     check(f"output buffer stores: all at imm=0 offset from s3",
           all(imm == 0 for _, _, _, _, imm in out_stores))
+
+    # ═══════════════════════════════════════════════════════════
+    # [2b] Concrete store address verification
+    # ═══════════════════════════════════════════════════════════
+    print("\n[2b] Concrete store address bounds (all stores hit designated regions)")
+
+    # Memory map for the compiler:
+    STORE_REGIONS = [
+        ("input buffer",   0x83000000, 0x84000000),
+        ("output buffer",  0x84000000, 0x85000000),
+        ("dictionary",     0x82000000, 0x82800000),
+        ("word buffer",    0x82800000, 0x82800100),
+        ("control stack",  0x82800100, 0x82800500),
+        ("patch list",     0x82800500, 0x82800900),
+        ("call site list", 0x82800900, 0x82900000),
+        ("UART",           0x10000000, 0x10000001),
+        ("shutdown",       0x00100000, 0x00100004),
+    ]
+
+    def classify_addr(addr):
+        for name, lo, hi in STORE_REGIONS:
+            if lo <= addr < hi:
+                return name
+        return None
+
+    # Run the compiler on diverse inputs and check every store
+    store_test_programs = [
+        "bye",
+        "42 drop bye",
+        "100000 drop bye",
+        "-1 drop bye",
+        "72 emit 101 emit 108 emit 108 emit 111 emit 10 emit bye",
+        ": star 42 emit ; star star star bye",
+        ": a 1 ; : b 2 ; : c a b + ; c drop bye",
+        "1 if 65 emit then bye",
+        "0 if 65 else 66 then drop bye",
+        "1 begin dup until drop bye",
+        "3 begin dup while 1 - repeat drop bye",
+        ": test 65 emit exit 66 emit ; test bye",
+        "5 0 do i drop loop bye",
+        "3 0 do 2 0 do i drop loop loop bye",
+        "1 2 lshift drop bye",
+        "16 2 rshift drop bye",
+        "3 5 u< drop bye",
+        "5 invert drop bye",
+        "5 negate drop bye",
+        "here drop bye",
+        "1 2 3 rot drop drop drop bye",
+        "1 2 swap drop drop bye",
+        "1 2 over drop drop drop bye",
+        "1 @ drop bye",
+        "1 2 ! bye",
+        "1 c@ drop bye",
+        "1 2 c! bye",
+        "key drop bye",
+        "\\ comment\nbye",
+        "( comment ) bye",
+    ]
+
+    all_stores_ok = True
+    total_stores_checked = 0
+    region_counts = {}
+    bad_stores = []
+
+    for src in store_test_programs:
+        input_bytes = src.encode('ascii') + b'\x04'
+        _, _, slog = simulate_forth(binary, input_bytes, log_stores=True)
+        total_stores_checked += len(slog)
+        for s_pc, s_addr, s_width in slog:
+            region = classify_addr(s_addr)
+            if region is None:
+                bad_stores.append((src, s_pc, s_addr, s_width))
+                all_stores_ok = False
+            else:
+                region_counts[region] = region_counts.get(region, 0) + 1
+
+    if bad_stores:
+        for src, s_pc, s_addr, s_width in bad_stores[:10]:
+            print(f"  OUT OF BOUNDS: pc=0x{s_pc:03x} addr=0x{s_addr:08x} "
+                  f"width={s_width} program={src!r}")
+
+    check(f"all {total_stores_checked} store operations hit designated regions",
+          all_stores_ok)
+
+    print(f"  Store distribution across {len(store_test_programs)} programs:")
+    for name, count in sorted(region_counts.items(), key=lambda x: -x[1]):
+        print(f"    {name}: {count}")
 
     # ═══════════════════════════════════════════════════════════
     # [3] Branch target verification
@@ -628,13 +723,31 @@ def main():
     expected_instrs = {
         "nop (magic)":               0x00000013,
         "lui s5, 0x10000":           0x10000AB7,
-        "lui s4, 0x85000":           0x85000A37,
-        "lui s2, 0x85800":           0x85800937,
+        "lui s4, 0x84100":           0x84100A37,
+        "lui s2, 0x84900":           0x84900937,
+        "lui x5, 0x80100 (heap)":    0x801002B7,
+        "addi x6, x5, 4 (heap)":     0x00428313,
+        "sw x6, 0(x5) (heap init)":  0x0062A023,
         "addi s4, s4, -4 (push)":    0xFFCA0A13,
         "sw s3, 0(s4) (push TOS)":   0x013A2023,
         "lw x19, 0(x20) (pop TOS)":  0x000A2983,
         "addi x20, x20, 4 (pop)":    0x004A0A13,
         "lw x5, 0(x20) (load 2nd)":  0x000A2283,
+        "sll x19 (lshift)":          0x013299B3,
+        "srl x19 (rshift)":          0x0132D9B3,
+        "sltu x19 (u<)":             0x0132B9B3,
+        "xori x19, -1 (invert)":     0xFFF9C993,
+        "lui x19, 0x80100 (here)":   0x801009B7,
+        "sw x19, 0(x18) (do)":       0x01392023,
+        "sw x5, 4(x18) (do)":        0x00592223,
+        "addi x18, x18, 8 (do)":     0x00890913,
+        "lw x5, -8(x18) (loop)":     0xFF892283,
+        "addi x5, x5, 1 (loop)":     0x00128293,
+        "lw x6, -4(x18) (loop)":     0xFFC92303,
+        "beq x5, x6, +12 (loop)":    0x00628663,
+        "sw x5, -8(x18) (loop)":     0xFE592C23,
+        "addi x18, x18, -8 (loop)":  0xFF890913,
+        "lw x19, -8(x18) (i)":       0xFF892983,
     }
 
     emitted_vals = set(emitted_instrs.values())
@@ -787,6 +900,42 @@ def main():
         ("nested word calls",
          ": a 65 emit ; : b a a ; b bye",
          None),
+
+        ("lshift primitive",
+         "1 3 lshift drop bye",
+         None),
+
+        ("rshift primitive",
+         "32 2 rshift drop bye",
+         None),
+
+        ("u< primitive",
+         "3 5 u< drop bye",
+         None),
+
+        ("invert primitive",
+         "0 invert drop bye",
+         None),
+
+        ("negate primitive",
+         "5 negate drop bye",
+         None),
+
+        ("here primitive",
+         "here drop bye",
+         None),
+
+        ("exit primitive",
+         ": test 65 emit exit 66 emit ; test bye",
+         None),
+
+        ("while/repeat loop",
+         "3 begin dup while dup drop 1 - repeat drop bye",
+         None),
+
+        ("do/loop",
+         "5 0 do i drop loop bye",
+         None),
     ]
 
     qemu_available = compile_forth_qemu("bye") is not None
@@ -829,22 +978,30 @@ def main():
     if bye_out and len(bye_out) >= 4:
         bye_words = [struct.unpack_from('<I', bye_out, i)[0]
                      for i in range(0, len(bye_out), 4)]
-        # Should be: nop, lui s5, lui s4, lui s2, <bye sequence>
+        # Prologue: nop, lui s5, lui s4, lui s2, heap init (3 words), then bye
         check("bye: word 0 = nop (0x00000013)", bye_words[0] == 0x00000013)
         if len(bye_words) > 1:
             check("bye: word 1 = lui s5, 0x10000 (0x10000AB7)",
                   bye_words[1] == 0x10000AB7)
         if len(bye_words) > 2:
-            check("bye: word 2 = lui s4, 0x85000 (0x85000A37)",
-                  bye_words[2] == 0x85000A37)
+            check("bye: word 2 = lui s4, 0x84100 (0x84100A37)",
+                  bye_words[2] == 0x84100A37)
         if len(bye_words) > 3:
-            check("bye: word 3 = lui s2, 0x85800 (0x85800937)",
-                  bye_words[3] == 0x85800937)
+            check("bye: word 3 = lui s2, 0x84900 (0x84900937)",
+                  bye_words[3] == 0x84900937)
+        # Heap init: lui x5,0x80100; addi x6,x5,4; sw x6,0(x5)
+        if len(bye_words) > 6:
+            check("bye: word 4 = lui x5, 0x80100 (0x801002B7)",
+                  bye_words[4] == 0x801002B7)
+            check("bye: word 5 = addi x6, x5, 4 (0x00428313)",
+                  bye_words[5] == 0x00428313)
+            check("bye: word 6 = sw x6, 0(x5) (0x0062A023)",
+                  bye_words[6] == 0x0062A023)
 
-        # Verify bye emits correct shutdown sequence
+        # Verify bye emits correct shutdown sequence (after prologue)
         bye_expected = [0x00100AB7, 0x000052B7, 0x55528293, 0x005AA023]
-        if len(bye_words) >= 8:
-            bye_tail = bye_words[4:8]
+        if len(bye_words) >= 11:
+            bye_tail = bye_words[7:11]
             check("bye: shutdown sequence correct",
                   bye_tail == bye_expected)
 
@@ -884,6 +1041,16 @@ def main():
         ": a 1 ; : b a a + ; b drop bye",
         ": x 1 ; : y 2 ; : z x y + ; z drop bye",
         "72 emit 101 emit 108 emit 108 emit 111 emit 10 emit bye",
+        "1 2 lshift drop bye",
+        "16 2 rshift drop bye",
+        "3 5 u< drop bye",
+        "5 invert drop bye",
+        "5 negate drop bye",
+        "here drop bye",
+        ": test 1 if exit then ; test bye",
+        "3 begin dup while 1 - repeat drop bye",
+        "5 0 do i drop loop bye",
+        "3 0 do 2 0 do i drop loop loop bye",
     ]
 
     jalr_found_anywhere = False
@@ -1045,6 +1212,77 @@ def main():
         ("5-char until wrong t", "unxil", None, None),
         ("5-char until wrong i", "untxl", None, None),
 
+        # New primitives
+        ("lshift", "1 2 lshift drop bye", None, None),
+        ("rshift", "16 2 rshift drop bye", None, None),
+        ("u<", "3 5 u< drop bye", None, None),
+        ("invert", "5 invert drop bye", None, None),
+        ("negate", "5 negate drop bye", None, None),
+        ("here", "here drop bye", None, None),
+
+        # 2-char near-miss for u<
+        ("2-char near-miss u>", "ux", None, None),
+
+        # 4-char near-miss for here
+        ("4-char near-miss hera", "hera", None, None),
+        ("4-char near-miss hexa", "hexa", None, None),
+        ("4-char near-miss hxre", "hxre", None, None),
+
+        # 6-char near-misses (exercises length-6 dispatch)
+        ("6-char near-miss lshifx", "lshifx", None, None),
+        ("6-char near-miss rshifx", "rshifx", None, None),
+        ("6-char near-miss inverx", "inverx", None, None),
+        ("6-char near-miss negatx", "negatx", None, None),
+        ("6-char lshift wrong s", "lxhift", None, None),
+        ("6-char lshift wrong h", "lsxift", None, None),
+        ("6-char lshift wrong i", "lshxft", None, None),
+        ("6-char lshift wrong f", "lshixt", None, None),
+        ("6-char rshift wrong s", "rxhift", None, None),
+        ("6-char rshift wrong h", "rsxift", None, None),
+        ("6-char rshift wrong i", "rshxft", None, None),
+        ("6-char rshift wrong f", "rshixt", None, None),
+        ("6-char invert wrong n", "ixvert", None, None),
+        ("6-char invert wrong v", "inxert", None, None),
+        ("6-char invert wrong e", "invxrt", None, None),
+        ("6-char invert wrong r", "invext", None, None),
+        ("6-char negate wrong e", "nxgate", None, None),
+        ("6-char negate wrong g", "nexate", None, None),
+        ("6-char negate wrong a", "negxte", None, None),
+        ("6-char negate wrong t", "negaxe", None, None),
+        # 6-char with wrong first char (not l/r/i/n)
+        ("6-char wrong first x", "xshift", None, None),
+        # 6-char repeat near-misses
+        ("6-char repeat wrong p", "rexeat", None, None),
+        ("6-char repeat wrong e2", "repxat", None, None),
+        ("6-char repeat wrong a", "repext", None, None),
+        ("6-char repeat wrong t", "repeax", None, None),
+        # 6-char r but not s or e (neither rshift nor repeat)
+        ("6-char r-other", "rxhift", None, None),
+
+        # exit
+        ("exit", ": test 65 emit exit 66 emit ; test bye", None, None),
+        # exit near-miss
+        ("4-char exit miss: exia", "exia", None, None),
+        ("4-char exit miss: exxa", "exxa", None, None),
+
+        # while/repeat
+        ("while/repeat", "3 begin dup while 1 - repeat drop bye", None, None),
+        # while near-miss
+        ("5-char while wrong h", "wxile", None, None),
+        ("5-char while wrong i", "whxle", None, None),
+        ("5-char while wrong l", "whixe", None, None),
+        ("5-char while wrong e", "whilx", None, None),
+
+        # do/loop/i
+        ("do/loop basic", "3 0 do i drop loop bye", None, None),
+        ("do/loop nested", "2 0 do 2 0 do i drop loop loop bye", None, None),
+        # do near-miss
+        ("2-char do miss: dx", "dx", None, None),
+        # loop near-miss
+        ("4-char loop miss: looa", "looa", None, None),
+        ("4-char loop miss: loxa", "loxa", None, None),
+        ("4-char loop miss: lxop", "lxop", None, None),
+
         # 3-char: match 1st+2nd but not 3rd (exercises 2nd-char-match, 3rd-char-miss)
         ("3-char dup miss 3rd: dua", "dua", None, None),
         ("3-char and miss 3rd: anx", "anc", None, None),
@@ -1159,6 +1397,8 @@ def main():
     print(f"    → bit-field round-trip validated (all {N} instructions)")
     print(f"    → ISA: no JALR / no SYSTEM / no FENCE / no M/A/F/D/C")
     print(f"    → exhaustive store enumeration ({len(stores)} stores, targets verified)")
+    print(f"    → concrete store bounds: {total_stores_checked} stores across "
+          f"{len(store_test_programs)} programs, all in designated regions")
     print(f"    → branch targets mechanically checked ({len(branches)} branches)")
     print(f"    → initialization + output + shutdown verified from bit fields")
     print(f"    → NO-JALR proof for compiled output (3 layers):")
