@@ -522,10 +522,62 @@ rx_desc_done:
 	add	t0, s11, t0
 	sh	zero, 0(t0)		# fail count = 0
 	sh	zero, 2(t0)		# fail mask = 0
-	# s9 = starting index = mtime % seed_count
+reprobe:
+	# Drain stale RX packets, then starve the ring to stop floods.
+reprobe_drain:
+	li	gp, 2
+	j	rx_poll
+rx_ret_drain:
+	beqz	a0, reprobe_drained
+	li	t0, 2
+	bne	a0, t0, reprobe_drain	# ARP was handled, loop again
+	# FAMC stale packet — do NOT repost. Let the ring starve.
+	j	reprobe_drain
+reprobe_drained:
+	# Ring is empty. Wait 50ms for in-flight packets to be dropped.
+	li	t0, MTIME_ADDR
+	lw	t1, 0(t0)
+reprobe_wait:
+	lw	t2, 0(t0)
+	sub	t2, t2, t1
+	li	t3, 500000		# 50ms at 10MHz
+	blt	t2, t3, reprobe_wait
+
+	# Reset the RX ring: sync proc_idx to used.idx, then post all 16
+	# descriptors fresh. This avoids double-posting on first entry.
+reprobe_reset_rx:
+	li	t0, NET_RX_QUEUE
+	add	t0, s11, t0
+	# Read used.idx as our baseline.
+	li	t2, 4096
+	add	t2, t0, t2		# used ring base
+	lhu	t1, 2(t2)		# used.idx
+	# Set RX_PROC_IDX = used.idx (nothing left to process).
+	li	t3, RX_PROC_IDX
+	add	t3, s11, t3
+	sh	t1, 0(t3)
+	# Set avail.idx = used.idx, then post descriptors 0..15.
+	sh	t1, 258(t0)		# avail.idx = used.idx
+	li	t2, 0
+reprobe_repost_loop:
+	li	t3, NET_RX_QUEUE_NUM
+	bge	t2, t3, reprobe_repost_done
+	lhu	t3, 258(t0)		# current avail.idx
+	andi	t4, t3, 15
+	slli	t4, t4, 1
+	addi	t4, t4, 260
+	add	t4, t0, t4
+	sh	t2, 0(t4)		# avail.ring[idx % 16] = i
+	addi	t3, t3, 1
+	sh	t3, 258(t0)		# avail.idx++
+	addi	t2, t2, 1
+	j	reprobe_repost_loop
+reprobe_repost_done:
+	.word	0x0110000F		# fence
+	sw	zero, VIO_QUEUE_NOTIFY(s0)
+	# Pick random starting seed = mtime % seed_count.
 	li	t0, MTIME_ADDR
 	lw	t0, 0(t0)
-	# t0 % s8: repeated subtraction
 	mv	t1, t0
 mtime_mod:
 	blt	t1, s8, mtime_mod_done
@@ -534,10 +586,35 @@ mtime_mod:
 mtime_mod_done:
 	mv	s9, t1			# s9 = start index
 
-	# Blast all seeds with request for chunk 0..0.
+	# Blast non-failed seeds with request for chunk 0..0.
 	mv	s1, s9			# current index
 	mv	s2, s8			# remaining count
 probe_loop:
+	# Skip seeds in the fail mask.
+	li	t0, NET_FAIL_MASK
+	add	t0, s11, t0
+	lhu	t1, 0(t0)
+	li	t0, 1
+	sll	t0, t0, s1
+	and	t0, t1, t0
+	bnez	t0, sfr_ret_probe	# skip failed seed
+	# Debug: print 'P' + seed index.
+	li	t0, UART_BASE
+dbg_pw:	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, dbg_pw
+	li	t1, 80			# 'P'
+	sb	t1, 0(t0)
+dbg_pw2:	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, dbg_pw2
+	addi	t1, s1, 48		# '0' + index
+	sb	t1, 0(t0)
+dbg_pw3:	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, dbg_pw3
+	li	t1, 10			# newline
+	sb	t1, 0(t0)
 	# Compute seed entry address: s7 + s1 * 6
 	slli	t0, s1, 1
 	add	t0, t0, s1
@@ -569,7 +646,7 @@ rx_ret_probe:
 	li	t0, 2
 	beq	a0, t0, probe_got_response
 
-	# Check timeout (10 seconds).
+	# Check timeout (10 seconds since probe blast).
 	li	t0, MTIME_ADDR
 	lw	t0, 0(t0)
 	sub	t1, t0, s5
@@ -609,6 +686,43 @@ find_next_seed:
 	j	find_seed
 
 seed_locked:
+	# Debug: print 'L' + seed index.
+	addi	sp, sp, -8
+	sw	a2, 0(sp)
+	sw	t5, 4(sp)
+	li	t0, UART_BASE
+dbg_lw:	lbu	t5, UART_LSR(t0)
+	andi	t5, t5, UART_TX_READY
+	beqz	t5, dbg_lw
+	li	t5, 76			# 'L'
+	sb	t5, 0(t0)
+dbg_lw2:	lbu	t5, UART_LSR(t0)
+	andi	t5, t5, UART_TX_READY
+	beqz	t5, dbg_lw2
+	addi	t5, s1, 48		# '0' + seed index
+	sb	t5, 0(t0)
+	# Print fail mask.
+	li	t5, NET_FAIL_MASK
+	add	t5, s11, t5
+	lhu	t5, 0(t5)
+dbg_lw3:	lbu	a2, UART_LSR(t0)
+	andi	a2, a2, UART_TX_READY
+	beqz	a2, dbg_lw3
+	li	a2, 109			# 'm'
+	sb	a2, 0(t0)
+dbg_lw4:	lbu	a2, UART_LSR(t0)
+	andi	a2, a2, UART_TX_READY
+	beqz	a2, dbg_lw4
+	addi	a2, t5, 48		# '0' + mask value
+	sb	a2, 0(t0)
+dbg_lw5:	lbu	a2, UART_LSR(t0)
+	andi	a2, a2, UART_TX_READY
+	beqz	a2, dbg_lw5
+	li	a2, 10			# newline
+	sb	a2, 0(t0)
+	lw	t5, 4(sp)
+	lw	a2, 0(sp)
+	addi	sp, sp, 8
 	# Check if this seed already failed hash check.
 	li	t0, NET_FAIL_MASK
 	add	t0, s11, t0
@@ -620,15 +734,23 @@ seed_locked:
 	j	seed_ok
 
 probe_skip_bad:
-	# This seed sent bad data before. Repost RX buf and keep polling.
-	li	gp, 6
-	j	repost_rx
-repost_ret_skip_bad:
+	# This seed sent bad data before. Repost descriptor (a3) and keep polling.
+	li	t0, NET_RX_QUEUE
+	add	t0, s11, t0
+	lhu	t1, 258(t0)		# avail.idx
+	andi	t2, t1, 15
+	slli	t2, t2, 1
+	addi	t2, t2, 260
+	add	t2, t0, t2
+	sh	a3, 0(t2)
+	addi	t1, t1, 1
+	sh	t1, 258(t0)
+	.word	0x0110000F		# fence
+	sw	zero, VIO_QUEUE_NOTIFY(s0)
 	# Check if ALL seeds are marked bad.
 	li	t0, NET_FAIL_MASK
 	add	t0, s11, t0
 	lhu	t1, 0(t0)
-	# Build mask with s8 bits set: (1 << seed_count) - 1
 	li	t2, 1
 	sll	t2, t2, s8
 	addi	t2, t2, -1
@@ -744,7 +866,21 @@ rx_ret_batch:
 	li	t0, 2
 	bne	a0, t0, batch_no_famc
 
-	# Got FAMC response. Check seq is in current batch range.
+	# Got FAMC response. Verify source IP matches locked seed (s2).
+	lbu	t0, 38(a2)
+	lbu	t1, 0(s2)
+	bne	t0, t1, batch_ignore
+	lbu	t0, 39(a2)
+	lbu	t1, 1(s2)
+	bne	t0, t1, batch_ignore
+	lbu	t0, 40(a2)
+	lbu	t1, 2(s2)
+	bne	t0, t1, batch_ignore
+	lbu	t0, 41(a2)
+	lbu	t1, 3(s2)
+	bne	t0, t1, batch_ignore
+
+	# Check seq is in current batch range.
 	# a1 = seq (chunk index)
 	blt	a1, s3, batch_ignore
 	bgt	a1, s9, batch_ignore
@@ -921,9 +1057,7 @@ seed_timeout:
 	li	gp, 2
 	j	emit_warn
 ew_ret_timeout:
-	li	s1, 0			# start from seed 0
-	mv	s2, s8			# remaining = seed count
-	j	probe_loop
+	j	reprobe
 
 download_complete:
 	# Hash the downloaded binary.
@@ -944,6 +1078,11 @@ ch_ret_net:
 	j	exec_binary
 
 net_hash_fail:
+	# Emit 'H' for hash mismatch.
+	li	a0, 72			# 'H'
+	li	gp, 1
+	j	emit_warn
+ew_ret_net:
 	# Mark this seed as bad in the fail mask.
 	li	t0, NET_FAIL_MASK
 	add	t0, s11, t0
@@ -952,20 +1091,19 @@ net_hash_fail:
 	sll	t2, t2, s1		# bit for current seed
 	or	t1, t1, t2
 	sh	t1, 0(t0)
-	li	a0, 72			# 'H' = hash mismatch
-	li	gp, 1
-	j	emit_warn
-ew_ret_net:
-	# Re-enter probe phase — blast all seeds again, skip bad ones.
-	li	s1, 0			# start from seed 0
-	mv	s2, s8			# remaining = seed count
-	j	probe_loop
+	# Check if all seeds have failed.
+	li	t2, 1
+	sll	t2, t2, s8
+	addi	t2, t2, -1
+	and	t3, t1, t2
+	beq	t3, t2, no_net		# all seeds exhausted
+	j	reprobe
 
 # ══════════════════════════════════════════════════════════════════════════
 # rx_poll -- check for a received packet, handle ARP, detect FAMC.
 #   Returns: a0=0 no packet, a0=1 ARP handled, a0=2 FAMC response
 #   On FAMC: a1=seq, a2=RX buffer ptr
-#   Dispatch: gp=0→rx_ret_probe, gp=1→rx_ret_batch
+#   Dispatch: gp=0→rx_ret_probe, gp=1→rx_ret_batch, gp=2→rx_ret_drain
 # ══════════════════════════════════════════════════════════════════════════
 rx_poll:
 	addi	sp, sp, -4
@@ -1091,8 +1229,10 @@ rx_poll_ret:
 	j	rx_ret_probe
 rxd_1:
 	li	t0, 1
+	beq	gp, t0, rx_ret_batch
+	li	t0, 2
 	bne	gp, t0, dispatch_error
-	j	rx_ret_batch
+	j	rx_ret_drain
 
 # ══════════════════════════════════════════════════════════════════════════
 # repost_rx -- repost an RX descriptor to the avail ring.
@@ -1129,8 +1269,6 @@ repost_rx_disp:
 	beq	gp, t0, repost_ret_arp
 	li	t0, 5
 	beq	gp, t0, repost_ret_unknown
-	li	t0, 6
-	beq	gp, t0, repost_ret_skip_bad
 	j	dispatch_error
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1315,6 +1453,13 @@ ip_cksum_loop:
 	.word	0x0110000F		# fence w,w
 	li	t2, 1
 	sw	t2, VIO_QUEUE_NOTIFY(s0)	# notify queue 1
+	# Wait for TX completion: spin until used.idx matches avail.idx.
+	lhu	t3, 18(t1)		# avail.idx (just incremented)
+sfr_tx_wait:
+	li	t2, 4096
+	add	t2, t1, t2		# used ring base
+	lhu	t2, 2(t2)		# used.idx
+	bne	t2, t3, sfr_tx_wait
 
 	lw	gp, 0(sp)
 	addi	sp, sp, 16
@@ -1449,6 +1594,13 @@ send_arp_reply:
 	.word	0x0110000F
 	li	t2, 1
 	sw	t2, VIO_QUEUE_NOTIFY(s0)
+	# Wait for TX completion.
+	lhu	t3, 18(t1)		# avail.idx
+sar_tx_wait:
+	li	t2, 4096
+	add	t2, t1, t2
+	lhu	t2, 2(t2)		# used.idx
+	bne	t2, t3, sar_tx_wait
 
 	j	sar_ret
 
