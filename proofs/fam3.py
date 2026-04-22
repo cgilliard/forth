@@ -2062,6 +2062,664 @@ def main():
     # RX delay
     tests.append(("RX delay", make_input("nop\n"), {0}))
 
+    # ── Additional tests for branch coverage ──
+
+    # Expression evaluator: +/- operators, symbol refs, parentheses
+    tests.append(("expr: equ+offset", make_input(".equ BASE, 0x100\n.word BASE+4\n")))
+    tests.append(("expr: equ-offset", make_input(".equ END, 0x200\n.word END-8\n")))
+    tests.append(("expr: label+off", make_input("data:\n.word 0\n.word data+4\n")))
+    tests.append(("expr: label-off", make_input("data:\n.word 0\n.word data-4\n")))
+    tests.append(("expr: paren", make_input(".word (1+2)\n")))
+    tests.append(("expr: nested paren", make_input(".word (10-(3+2))\n")))
+    tests.append(("expr: equ chain", make_input(".equ A, 10\n.equ B, A+5\naddi a0, zero, B\n")))
+    tests.append(("expr: zero", make_input(".word 0+0\n")))
+
+    # Char literals in immediates
+    tests.append(("char imm: A", make_input("addi a0, zero, 'A'\n")))
+    tests.append(("char imm: newline", make_input("addi a0, zero, '\\n'\n")))
+    tests.append(("char imm: tab", make_input("addi a0, zero, '\\t'\n")))
+    tests.append(("char imm: backslash", make_input("addi a0, zero, '\\\\'\n")))
+    tests.append(("char imm: zero", make_input("addi a0, zero, '\\0'\n")))
+    tests.append(("char imm: space", make_input("addi a0, zero, ' '\n")))
+    tests.append(("char imm: quote", make_input("addi a0, zero, '\\''\n")))
+
+    # String literals with escapes
+    tests.append((".ascii escapes", make_input('.ascii "\\t\\r\\0\\\\\\\""\n')))
+    tests.append((".ascii empty", make_input('.ascii ""\n')))
+    tests.append((".ascii long", make_input('.ascii "abcdefghijklmnop"\n')))
+
+    # Multi-value directives
+    tests.append((".byte multi", make_input(".byte 1, 2, 3, 4, 5\n")))
+    tests.append((".byte hex", make_input(".byte 0xAA, 0xBB, 0xCC\n")))
+    tests.append((".word multi", make_input(".word 0x1234, 0x5678, 0x9ABC\n")))
+    tests.append((".word expr", make_input(".equ X, 100\n.word X+1, X+2\n")))
+    tests.append((".zero large", make_input(".zero 64\n")))
+    tests.append((".zero 1", make_input(".zero 1\n")))
+
+    # Register parsing: xN numeric format
+    for n in [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19,
+              21, 22, 23, 24, 25, 26, 27, 28, 29, 30]:
+        tests.append((f"reg: x{n}", make_input(f"addi x{n}, x{n}, 0\n")))
+    tests.append(("reg: x0 dest", make_input("add x0, x1, x2\n")))
+
+    # I-type bitwise with large unsigned immediates (0..4095 range)
+    tests.append(("andi large", make_input("andi a0, a1, 0xFF\n")))
+    tests.append(("ori large", make_input("ori a0, a1, 0xFFF\n")))
+    tests.append(("xori large", make_input("xori a0, a1, 0x800\n")))
+    tests.append(("andi zero", make_input("andi a0, a1, 0\n")))
+
+    # I-type arithmetic with boundary immediates
+    tests.append(("addi max", make_input("addi a0, a1, 2047\n")))
+    tests.append(("addi min", make_input("addi a0, a1, -2048\n")))
+    tests.append(("slti neg", make_input("slti a0, a1, -1\n")))
+    tests.append(("sltiu large", make_input("sltiu a0, a1, 0xFF\n")))
+
+    # Local labels
+    tests.append(("local: 0f/0b", make_input("0:\nnop\nbeq a0, zero, 0b\nj 0f\nnop\n0:\n")))
+    tests.append(("local: 1f/1b", make_input("1:\naddi a0, zero, 1\nbeq a0, zero, 1b\nj 1f\nnop\n1:\n")))
+    tests.append(("local: multi", make_input("0:\n1:\nbeq a0, zero, 0b\nbeq a1, zero, 1b\nj 0f\n0:\nj 1f\n1:\n")))
+    tests.append(("local: redefine", make_input("0:\nnop\n0:\nnop\nbeq a0, zero, 0b\n")))
+
+    # Branch target: numeric offsets (positive and negative)
+    tests.append(("branch: neg offset", make_input("top:\nnop\nbeq a0, a1, -4\n")))
+    tests.append(("branch: zero offset", make_input("beq a0, a1, 0\n")))
+    tests.append(("branch: large fwd", make_input(
+        "beq a0, a1, far\n" + "nop\n" * 20 + "far:\n")))
+
+    # Long forward jump (tests relaxation)
+    tests.append(("j long fwd", make_input(
+        "j far\n" + "nop\n" * 50 + "far:\n")))
+    tests.append(("beq long fwd", make_input(
+        "beq a0, zero, far\n" + "nop\n" * 50 + "far:\n")))
+
+    # Comments after instructions
+    tests.append(("inline comment", make_input("add a0, a1, a2 # comment\n")))
+    tests.append(("comment only line", make_input("# full line comment\nnop\n")))
+    tests.append(("comment after label", make_input("my_label: # label comment\nnop\n")))
+
+    # Inline comments on directives
+    tests.append((".equ comment", make_input(".equ VAL, 42 # comment\naddi a0, zero, VAL\n")))
+    tests.append((".word comment", make_input(".word 0xDEAD # comment\n")))
+
+    # Memory operand forms
+    tests.append(("load: 0(reg)", make_input("lw a0, 0(a1)\n")))
+    tests.append(("load: max(reg)", make_input("lw a0, 2047(a1)\n")))
+    tests.append(("load: min(reg)", make_input("lw a0, -2048(a1)\n")))
+    tests.append(("store: 0(reg)", make_input("sw a0, 0(a1)\n")))
+    tests.append(("store: max(reg)", make_input("sw a0, 2047(a1)\n")))
+    tests.append(("store: min(reg)", make_input("sw a0, -2048(a1)\n")))
+
+    # li edge cases
+    tests.append(("li 0", make_input("li a0, 0\n")))
+    tests.append(("li 2047", make_input("li a0, 2047\n")))
+    tests.append(("li 2048", make_input("li a0, 2048\n")))
+    tests.append(("li -2048", make_input("li a0, -2048\n")))
+    tests.append(("li -2049", make_input("li a0, -2049\n")))
+    tests.append(("li 0x7FF", make_input("li a0, 0x7FF\n")))
+    tests.append(("li 0x800", make_input("li a0, 0x800\n")))
+    tests.append(("li 0xFFFFF800", make_input("li a0, 0xFFFFF800\n")))
+    tests.append(("li 0xFFFFFFFF", make_input("li a0, 0xFFFFFFFF\n")))
+
+    # Pseudo-instructions with varied registers
+    tests.append(("neg t3", make_input("neg t3, t4\n")))
+    tests.append(("not s0", make_input("not s0, s1\n")))
+    tests.append(("seqz s2", make_input("seqz s2, s3\n")))
+    tests.append(("snez a3", make_input("snez a3, a4\n")))
+    tests.append(("mv s5", make_input("mv s5, s6\n")))
+
+    # Two-op branch pseudos with varied registers
+    tests.append(("bgt s0 s1", make_input("top:\nbgt s0, s1, top\n")))
+    tests.append(("ble a2 a3", make_input("top:\nble a2, a3, top\n")))
+    tests.append(("bgtu t0 t1", make_input("top:\nbgtu t0, t1, top\n")))
+    tests.append(("bleu t2 t3", make_input("top:\nbleu t2, t3, top\n")))
+
+    # prologue with different register sets
+    tests.append(("prologue 1 reg", make_input("prologue s0, zero, zero\nepilogue\n")))
+    tests.append(("prologue 3 reg", make_input("prologue s0, s1, s2\nepilogue\n")))
+    tests.append(("prologue ra", make_input("prologue ra, s0, zero\nepilogue\n")))
+
+    # Multiple fixups to same label
+    tests.append(("multi fixup", make_input(
+        "beq a0, zero, end\nbeq a1, zero, end\nbeq a2, zero, end\nnop\nend:\n")))
+    tests.append(("j multi fixup", make_input(
+        "j end\nnop\nj end\nnop\nend:\n")))
+
+    # Mixed hex and asm
+    tests.append(("hex mid asm", make_input(
+        "addi a0, zero, 1\n13 00 00 00\naddi a1, zero, 2\n")))
+
+    # lla with forward reference
+    tests.append(("lla fwd", make_input("lla a0, data\nnop\ndata:\n.word 42\n")))
+    tests.append(("lla far", make_input(
+        "lla a0, data\n" + "nop\n" * 20 + "data:\n.word 99\n")))
+
+    # Larger mixed program
+    tests.append(("mixed program", make_input(
+        ".equ UART, 0x10000000\n"
+        ".equ MAGIC, 0x5555\n"
+        "lui a0, 0x10000\n"
+        "li a1, MAGIC\n"
+        "sb a1, 0(a0)\n"
+        "loop:\n"
+        "lbu a2, 5(a0)\n"
+        "andi a2, a2, 0x01\n"
+        "beqz a2, loop\n"
+        "lbu a3, 0(a0)\n"
+        "beq a3, zero, done\n"
+        "j loop\n"
+        "done:\n"
+        "li t0, 0x100000\n"
+        "li t1, MAGIC\n"
+        "sw t1, 0(t0)\n"
+    )))
+
+    # Mnemonic near-misses (hit mismatch branches in char comparison)
+    tests.append(("near: ada", make_input("addi a0, zero, 0\n")))  # hits 'add' path then diverges
+    tests.append(("near: sub then add", make_input("sub a0, a1, a2\nadd a0, a1, a2\n")))
+    tests.append(("near: sll srl sra", make_input("sll a0,a1,a2\nsrl a0,a1,a2\nsra a0,a1,a2\n")))
+    tests.append(("near: slt sltu slti sltiu", make_input(
+        "slt a0,a1,a2\nsltu a0,a1,a2\nslti a0,a1,1\nsltiu a0,a1,1\n")))
+    tests.append(("near: beq bne blt bge bltu bgeu", make_input(
+        "top:\nbeq a0,a1,top\nbne a0,a1,top\nblt a0,a1,top\n"
+        "bge a0,a1,top\nbltu a0,a1,top\nbgeu a0,a1,top\n")))
+    tests.append(("near: lb lbu lh lhu lw", make_input(
+        "lb a0,0(sp)\nlbu a0,0(sp)\nlh a0,0(sp)\nlhu a0,0(sp)\nlw a0,0(sp)\n")))
+    tests.append(("near: sb sh sw", make_input("sb a0,0(sp)\nsh a0,0(sp)\nsw a0,0(sp)\n")))
+
+    # jal with default rd (if supported)
+    tests.append(("jal no rd", make_input("jal skip\nnop\nskip:\n")))
+
+    # Sequences that exercise dispatch chains (gp routing)
+    tests.append(("dispatch: neg+not+seqz+snez", make_input(
+        "neg a0,a1\nnot a0,a1\nseqz a0,a1\nsnez a0,a1\n")))
+    tests.append(("dispatch: sltz+sgtz", make_input("sltz a0,a1\nsgtz a0,a1\n")))
+    tests.append(("dispatch: all branch pseudo", make_input(
+        "top:\nbeqz a0,top\nbnez a0,top\nbltz a0,top\nbgez a0,top\nblez a0,top\n"
+        "bgt a0,a1,top\nble a0,a1,top\nbgtu a0,a1,top\nbleu a0,a1,top\n")))
+
+    # Expressions in immediates
+    tests.append(("expr in addi", make_input(".equ OFF, 10\naddi a0, a1, OFF+5\n")))
+    tests.append(("expr in li", make_input(".equ BASE, 0x1000\nli a0, BASE+0x234\n")))
+
+    # .byte with char
+    tests.append((".byte char", make_input(".byte 'A', 'B', 'C'\n")))
+    tests.append((".byte expr", make_input(".equ X, 10\n.byte X+1, X+2\n")))
+
+    # Whitespace variations
+    tests.append(("tabs", make_input("\tadd\ta0,\ta1,\ta2\n")))
+    tests.append(("extra spaces", make_input("  add   a0 , a1 , a2  \n")))
+
+    # ── Encoding boundary tests (range check branches) ──
+
+    # U-type boundary: lui imm20 = 0xFFFFF (max), 0x80000 (mid), 0 (min)
+    tests.append(("lui max", make_input("lui a0, 0xFFFFF\n")))
+    tests.append(("lui mid", make_input("lui a0, 0x80000\n")))
+    tests.append(("lui 1", make_input("lui a0, 1\n")))
+    tests.append(("lui 0", make_input("lui a0, 0\n")))
+    tests.append(("auipc max", make_input("auipc a0, 0xFFFFF\n")))
+
+    # I-type arith boundary: exactly 2047, exactly -2048
+    tests.append(("addi 2047", make_input("addi a0, zero, 2047\n")))
+    tests.append(("addi -2048", make_input("addi a0, zero, -2048\n")))
+    tests.append(("addi 1", make_input("addi a0, zero, 1\n")))
+    tests.append(("addi -1", make_input("addi a0, zero, -1\n")))
+    tests.append(("slti 2047", make_input("slti a0, a1, 2047\n")))
+    tests.append(("slti -2048", make_input("slti a0, a1, -2048\n")))
+
+    # I-type bitwise boundary: andi with 4095 (max), 0 (min)
+    tests.append(("andi 4095", make_input("andi a0, a1, 0xFFF\n")))
+    tests.append(("andi 2048", make_input("andi a0, a1, 0x800\n")))
+    tests.append(("ori 4095", make_input("ori a0, a1, 0xFFF\n")))
+    tests.append(("xori 4095", make_input("xori a0, a1, 0xFFF\n")))
+    tests.append(("andi -1", make_input("andi a0, a1, -1\n")))
+    tests.append(("andi -2048", make_input("andi a0, a1, -2048\n")))
+
+    # S-type boundary: store offset exactly 2047, exactly -2048
+    tests.append(("sw 2047", make_input("sw a0, 2047(a1)\n")))
+    tests.append(("sw -2048", make_input("sw a0, -2048(a1)\n")))
+    tests.append(("sb 2047", make_input("sb a0, 2047(a1)\n")))
+    tests.append(("sh -2048", make_input("sh a0, -2048(a1)\n")))
+
+    # B-type boundary: numeric offsets at ±4094
+    tests.append(("beq off 4094", make_input("beq a0, a1, 4094\n")))
+    tests.append(("beq off -4096", make_input("beq a0, a1, -4096\n")))
+    tests.append(("bne off 4094", make_input("bne a0, a1, 4094\n")))
+    tests.append(("blt off -4", make_input("blt a0, a1, -4\n")))
+
+    # Load offset boundaries
+    tests.append(("lw 2047", make_input("lw a0, 2047(a1)\n")))
+    tests.append(("lw -2048", make_input("lw a0, -2048(a1)\n")))
+    tests.append(("lb 2047", make_input("lb a0, 2047(sp)\n")))
+    tests.append(("lhu -2048", make_input("lhu a0, -2048(sp)\n")))
+
+    # ── Mnemonic dispatch near-misses ──
+    # Exercise character comparison branches deep in mnemonic tree
+    # These trigger the "almost matched" paths
+
+    # Words starting with 'a' (add, addi, and, andi, auipc)
+    tests.append(("mnem: all a-words", make_input(
+        "add a0,a1,a2\naddi a0,a1,1\nand a0,a1,a2\nandi a0,a1,1\nauipc a0,0\n")))
+
+    # Words starting with 's' (sub, sll, slli, srl, srli, sra, srai, slt, sltu, slti, sltiu, sb, sh, sw)
+    tests.append(("mnem: all s-words", make_input(
+        "sub a0,a1,a2\nsll a0,a1,a2\nslli a0,a1,1\nsrl a0,a1,a2\nsrli a0,a1,1\n"
+        "sra a0,a1,a2\nsrai a0,a1,1\nslt a0,a1,a2\nsltu a0,a1,a2\n"
+        "slti a0,a1,1\nsltiu a0,a1,1\nsb a0,0(sp)\nsh a0,0(sp)\nsw a0,0(sp)\n")))
+
+    # Words starting with 'b' (beq, bne, blt, bge, bltu, bgeu)
+    tests.append(("mnem: all b-words", make_input(
+        "top:\nbeq a0,a1,top\nbne a0,a1,top\nblt a0,a1,top\n"
+        "bge a0,a1,top\nbltu a0,a1,top\nbgeu a0,a1,top\n")))
+
+    # Words starting with 'l' (lb, lbu, lh, lhu, lw, lui, li, lla)
+    tests.append(("mnem: all l-words", make_input(
+        "lb a0,0(sp)\nlbu a0,0(sp)\nlh a0,0(sp)\nlhu a0,0(sp)\nlw a0,0(sp)\n"
+        "lui a0,1\nli a0,42\nlla a0,here\nhere:\n")))
+
+    # Words starting with 'j' (jal, j)
+    tests.append(("mnem: j-words", make_input("j skip\njal ra,skip\nskip:\n")))
+
+    # Words starting with 'o' and 'x' (or, ori, xor, xori)
+    tests.append(("mnem: ox-words", make_input(
+        "or a0,a1,a2\nori a0,a1,1\nxor a0,a1,a2\nxori a0,a1,1\n")))
+
+    # All pseudos together (exercises many dispatch paths)
+    tests.append(("all pseudos", make_input(
+        "nop\nli a0,1\nmv a0,a1\nneg a0,a1\nnot a0,a1\n"
+        "seqz a0,a1\nsnez a0,a1\nsltz a0,a1\nsgtz a0,a1\n"
+        "wfi\ntop:\nj top\n"
+        "beqz a0,top\nbnez a0,top\nbltz a0,top\nbgez a0,top\nblez a0,top\n"
+        "bgt a0,a1,top\nble a0,a1,top\nbgtu a0,a1,top\nbleu a0,a1,top\n")))
+
+    # ── Fixup handling paths ──
+
+    # Forward B-type fixup for each branch type
+    for m in ['beq','bne','blt','bge','bltu','bgeu']:
+        tests.append((f"fwd fixup: {m}", make_input(
+            f"{m} a0, a1, end\n" + "nop\n" * 5 + "end:\n")))
+
+    # Forward J-type fixup (jal)
+    tests.append(("fwd fixup: jal", make_input("jal ra, end\n" + "nop\n" * 5 + "end:\n")))
+
+    # Forward lla fixup
+    tests.append(("fwd fixup: lla", make_input("lla a0, data\n" + "nop\n" * 5 + "data:\n.word 0\n")))
+
+    # Multiple forward refs to different labels
+    tests.append(("multi fwd labels", make_input(
+        "beq a0, zero, lab1\nbeq a1, zero, lab2\nnop\nlab1:\nnop\nlab2:\n")))
+
+    # Long forward branch (tests relaxation fixup)
+    tests.append(("long fwd branch fixup", make_input(
+        "beq a0, zero, far\n" + "nop\n" * 300 + "far:\n")))
+
+    # ── Dispatch gp routing (trigger specific callsites) ──
+
+    # Multiple stores in sequence (exercises store emit dispatch)
+    tests.append(("multi store", make_input(
+        "sb a0,0(sp)\nsh a0,0(sp)\nsw a0,0(sp)\n"
+        "sb a1,4(a2)\nsh a1,4(a2)\nsw a1,4(a2)\n")))
+
+    # Multiple loads (exercises load emit dispatch)
+    tests.append(("multi load", make_input(
+        "lb a0,0(sp)\nlh a0,0(sp)\nlw a0,0(sp)\n"
+        "lbu a0,0(sp)\nlhu a0,0(sp)\n"
+        "lb a1,4(a2)\nlh a1,4(a2)\nlw a1,4(a2)\n")))
+
+    # Multiple branches (exercises B-type emit dispatch)
+    tests.append(("multi branch", make_input(
+        "top:\nbeq a0,a1,top\nbne a0,a1,top\n"
+        "blt a0,a1,top\nbge a0,a1,top\n"
+        "bltu a0,a1,top\nbgeu a0,a1,top\n"
+        "beq a2,a3,top\nbne a2,a3,top\n")))
+
+    # Multiple U-type in sequence
+    tests.append(("multi u-type", make_input(
+        "lui a0,0x100\nlui a1,0x200\nauipc a2,0\nauipc a3,0x1000\n")))
+
+    # Multiple J-type
+    tests.append(("multi j-type", make_input(
+        "jal ra,s1\ns1:\njal ra,s2\ns2:\njal zero,s3\nnop\ns3:\n")))
+
+    # Combined program exercising many emit paths
+    tests.append(("comprehensive emit", make_input(
+        ".equ UART, 0x10000000\n"
+        ".equ SIZE, 1024\n"
+        "lui a0, 0x10000\n"
+        "auipc a1, 0\n"
+        "addi a2, zero, SIZE\n"
+        "andi a3, a2, 0xFF\n"
+        "ori a4, zero, 0x55\n"
+        "xori a5, a4, 0xAA\n"
+        "add t0, a0, a2\n"
+        "sub t1, t0, a2\n"
+        "sll t2, a3, a4\n"
+        "srl t3, a3, a4\n"
+        "sra t4, a3, a4\n"
+        "slt t5, a0, a1\n"
+        "sltu t6, a0, a1\n"
+        "slli s0, a0, 4\n"
+        "srli s1, a0, 8\n"
+        "srai s2, a0, 16\n"
+        "slti s3, a0, 100\n"
+        "sltiu s4, a0, 200\n"
+        "sw t0, 0(sp)\n"
+        "sh t1, 4(sp)\n"
+        "sb t2, 8(sp)\n"
+        "lw s5, 0(sp)\n"
+        "lh s6, 4(sp)\n"
+        "lb s7, 8(sp)\n"
+        "lhu s8, 4(sp)\n"
+        "lbu s9, 8(sp)\n"
+        "li s10, 0xDEADBEEF\n"
+        "li s11, -1\n"
+        "mv gp, a0\n"
+        "neg tp, a1\n"
+        "not t0, a2\n"
+        "seqz t1, a3\n"
+        "snez t2, a4\n"
+        "sltz t3, a5\n"
+        "sgtz t4, t0\n"
+        "loop:\n"
+        "beq a0, a1, skip1\n"
+        "bne a0, a1, skip1\n"
+        "skip1:\n"
+        "blt a0, a1, skip2\n"
+        "bge a0, a1, skip2\n"
+        "skip2:\n"
+        "bltu a0, a1, skip3\n"
+        "bgeu a0, a1, skip3\n"
+        "skip3:\n"
+        "beqz a0, skip4\n"
+        "bnez a1, skip4\n"
+        "skip4:\n"
+        "bltz a0, skip5\n"
+        "bgez a1, skip5\n"
+        "blez a0, skip5\n"
+        "skip5:\n"
+        "bgt a0, a1, skip6\n"
+        "ble a0, a1, skip6\n"
+        "bgtu a0, a1, skip6\n"
+        "bleu a0, a1, skip6\n"
+        "skip6:\n"
+        "jal ra, fn\n"
+        "j done\n"
+        "fn:\n"
+        "nop\n"
+        "jal zero, fn_end\n"
+        "fn_end:\n"
+        "done:\n"
+        "lla a0, data\n"
+        ".byte 0xAA, 0xBB\n"
+        ".word 0x12345678\n"
+        '.ascii "test\\n"\n'
+        ".zero 4\n"
+        "data:\n"
+        ".word 42\n"
+    )))
+
+    # ── Token reading edge cases ──
+    # String token followed immediately by instruction
+    tests.append(("str then asm", make_input('.ascii "hi"\naddi a0,zero,1\n')))
+    # Char literal in .byte
+    tests.append((".byte char lit", make_input(".byte 'X'\n")))
+    # Multiple tokens on same concept
+    tests.append(("label colon space", make_input("my_label : nop\n")))
+
+    # ── Prologue/epilogue dispatch paths ──
+    tests.append(("prologue then code", make_input(
+        "prologue ra, s0, s1\naddi a0, zero, 42\nepilogue\n")))
+
+    # ── .equ used in different contexts ──
+    tests.append(("equ in store", make_input(".equ OFF, 16\nsw a0, OFF(sp)\n")))
+    tests.append(("equ in load", make_input(".equ OFF, 8\nlw a0, OFF(sp)\n")))
+    tests.append(("equ in branch", make_input(".equ BACK, -4\nbeq a0, a1, BACK\n")))
+    tests.append(("equ in lui", make_input(".equ PAGE, 0x80000\nlui a0, PAGE\n")))
+
+    # ── More register format coverage ──
+    # ABI names that require multi-char matching
+    tests.append(("reg: s10 s11", make_input("add s10, s11, s10\n")))
+    tests.append(("reg: a0-a7", make_input(
+        "add a0,a1,a2\nadd a3,a4,a5\nadd a6,a7,a0\n")))
+    tests.append(("reg: t3-t6", make_input(
+        "add t3,t4,t5\nadd t6,t3,t4\n")))
+
+    # ── Error-triggering inputs (exercises halt_err, decimal print, error dispatch) ──
+
+    # Invalid mnemonic (triggers find_mnem not-found → error)
+    tests.append(("err: bad mnem", make_input("badmnem a0, a1, a2\n")))
+    tests.append(("err: bad mnem 2", make_input("adx a0, a1, 1\n")))
+    tests.append(("err: bad mnem 3", make_input("foo\n")))
+
+    # Invalid register name
+    tests.append(("err: bad reg", make_input("add a0, a1, q7\n")))
+    tests.append(("err: bad reg x", make_input("add x0, x1, x32\n")))
+
+    # Out-of-range I-type immediate
+    tests.append(("err: addi overflow", make_input("addi a0, a1, 3000\n")))
+    tests.append(("err: addi underflow", make_input("addi a0, a1, -3000\n")))
+    tests.append(("err: slti overflow", make_input("slti a0, a1, 5000\n")))
+
+    # Out-of-range U-type immediate
+    tests.append(("err: lui overflow", make_input("lui a0, 0x100000\n")))
+    tests.append(("err: auipc overflow", make_input("auipc a0, 0x100000\n")))
+
+    # Out-of-range B-type immediate (too large numeric offset)
+    tests.append(("err: branch overflow", make_input("beq a0, a1, 8192\n")))
+    tests.append(("err: branch odd", make_input("beq a0, a1, 5\n")))
+
+    # Out-of-range store offset
+    tests.append(("err: sw overflow", make_input("sw a0, 3000(sp)\n")))
+    tests.append(("err: sw underflow", make_input("sw a0, -3000(sp)\n")))
+
+    # Out-of-range andi (bitwise > 4095)
+    tests.append(("err: andi overflow", make_input("andi a0, a1, 5000\n")))
+    tests.append(("err: ori overflow", make_input("ori a0, a1, 5000\n")))
+
+    # Error on line > 1 (exercises multi-digit line number printing)
+    tests.append(("err: line 5", make_input("nop\nnop\nnop\nnop\nbadmnem\n")))
+    tests.append(("err: line 10", make_input(
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nbadmnem\n")))
+    tests.append(("err: line 25", make_input(
+        ("nop\n" * 24) + "badmnem\n")))
+
+    # ── rdch/wrch dispatch paths (need diverse callsites) ─���
+
+    # String literal exercises rdch from rt_str (different gp than normal)
+    tests.append(("str lit and code", make_input(
+        '.ascii "ABCDEFGH"\n'
+        "addi a0, zero, 1\n"
+        '.ascii "XY"\n')))
+
+    # Char literal exercises rdch from rt_chr
+    tests.append(("char lit various", make_input(
+        "addi a0, zero, 'Z'\n"
+        "addi a1, zero, '0'\n"
+        "addi a2, zero, '\\n'\n"
+        ".byte 'A', 'B'\n")))
+
+    # Multiple .equ definitions (exercises equ_cp loop)
+    tests.append(("many equs", make_input(
+        ".equ A, 1\n.equ B, 2\n.equ C, 3\n.equ D, 4\n.equ E, 5\n"
+        "addi a0, zero, A\naddi a1, zero, E\n")))
+
+    # Label lookup with many symbols (exercises find_sym loop)
+    tests.append(("many syms", make_input(
+        ".equ AA, 1\n.equ BB, 2\n.equ CC, 3\n.equ DD, 4\n"
+        ".equ EE, 5\n.equ FF, 6\n.equ GG, 7\n.equ HH, 8\n"
+        "addi a0, zero, HH\n")))
+
+    # Forward ref + backward ref in same program
+    tests.append(("mixed refs", make_input(
+        "j mid\nstart:\nnop\nmid:\nbeq a0, zero, start\nj end\nend:\n")))
+
+    # Large decimal line number in error (exercises he_dec more deeply)
+    tests.append(("err: line 100", make_input(("nop\n" * 99) + "badmnem\n")))
+
+    # RX delays on different bytes (exercises rdch poll paths)
+    tests.append(("RX delay byte 2", make_input("nop\n"), {1}))
+    tests.append(("RX delay byte 5", make_input("addi a0, zero, 1\n"), {3}))
+    tests.append(("RX delay multi", make_input("nop\naddi a0, zero, 1\n"), {0, 2, 4}))
+
+    # ── Parse_imm char literal edge cases ──
+    # Exercise all escape paths and the plain char path
+    tests.append(("imm: '\\r'", make_input("addi a0, zero, '\\r'\n")))
+    tests.append(("imm: '\\0'", make_input("addi a0, zero, '\\0'\n")))
+    tests.append(("imm: '\\''", make_input("addi a0, zero, '\\''\n")))
+    tests.append(("imm: plain a", make_input("addi a0, zero, 'a'\n")))
+    tests.append(("imm: plain 0", make_input("addi a0, zero, '0'\n")))
+
+    # Hex parsing with uppercase, lowercase, mixed
+    tests.append(("imm: 0xABCDEF", make_input("li a0, 0xABCDEF\n")))
+    tests.append(("imm: 0xabcdef", make_input("li a0, 0xabcdef\n")))
+    tests.append(("imm: 0xAaBb", make_input("li a0, 0xAaBb\n")))
+    tests.append(("imm: 0x0", make_input("addi a0, zero, 0x0\n")))
+    tests.append(("imm: 0x1", make_input("addi a0, zero, 0x1\n")))
+
+    # Decimal parsing
+    tests.append(("imm: decimal 0", make_input("addi a0, zero, 0\n")))
+    tests.append(("imm: decimal 100", make_input("addi a0, zero, 100\n")))
+    tests.append(("imm: decimal 999", make_input("addi a0, zero, 999\n")))
+    tests.append(("imm: +42", make_input("addi a0, zero, +42\n")))
+
+    # ── Register parse_reg edge cases ──
+    # x0 through x31 individually to hit both pr_x1 and pr_x2 paths
+    tests.append(("reg: x0-x9", make_input(
+        "add x0,x1,x2\nadd x3,x4,x5\nadd x6,x7,x8\nadd x9,x0,x1\n")))
+    tests.append(("reg: x10-x19", make_input(
+        "add x10,x11,x12\nadd x13,x14,x15\nadd x16,x17,x18\nadd x19,x10,x11\n")))
+    tests.append(("reg: x20-x31", make_input(
+        "add x20,x21,x22\nadd x23,x24,x25\nadd x26,x27,x28\nadd x29,x30,x31\n")))
+
+    # ── Mnemonic matching: exercise deep char comparison paths ──
+    # Names that share prefixes and diverge late
+    tests.append(("mnem: srl vs sra", make_input("srl a0,a1,a2\nsra a0,a1,a2\n")))
+    tests.append(("mnem: srli vs srai", make_input("srli a0,a1,1\nsrai a0,a1,1\n")))
+    tests.append(("mnem: slt vs sltu", make_input("slt a0,a1,a2\nsltu a0,a1,a2\n")))
+    tests.append(("mnem: slti vs sltiu", make_input("slti a0,a1,1\nsltiu a0,a1,1\n")))
+    tests.append(("mnem: beq vs bne", make_input("top:\nbeq a0,a1,top\nbne a0,a1,top\n")))
+    tests.append(("mnem: blt vs bltu", make_input("top:\nblt a0,a1,top\nbltu a0,a1,top\n")))
+    tests.append(("mnem: bge vs bgeu", make_input("top:\nbge a0,a1,top\nbgeu a0,a1,top\n")))
+    tests.append(("mnem: lb vs lbu", make_input("lb a0,0(sp)\nlbu a0,0(sp)\n")))
+    tests.append(("mnem: lh vs lhu", make_input("lh a0,0(sp)\nlhu a0,0(sp)\n")))
+    tests.append(("mnem: add vs addi", make_input("add a0,a1,a2\naddi a0,a1,1\n")))
+    tests.append(("mnem: and vs andi", make_input("and a0,a1,a2\nandi a0,a1,1\n")))
+    tests.append(("mnem: or vs ori", make_input("or a0,a1,a2\nori a0,a1,1\n")))
+    tests.append(("mnem: xor vs xori", make_input("xor a0,a1,a2\nxori a0,a1,1\n")))
+    tests.append(("mnem: sll vs slli", make_input("sll a0,a1,a2\nslli a0,a1,1\n")))
+
+    # ── Encoding range boundary tests (emit_*_inst range checks) ──
+    # Exact boundary values that hit bge/beq taken+not-taken
+    # S-type: offset exactly at limits
+    tests.append(("sw off 2046", make_input("sw a0, 2046(a1)\n")))
+    tests.append(("sw off -2047", make_input("sw a0, -2047(a1)\n")))
+    tests.append(("sw off 1", make_input("sw a0, 1(a1)\n")))
+
+    # B-type: even offsets at limits
+    tests.append(("beq off 4092", make_input("beq a0, a1, 4092\n")))
+    tests.append(("bne off -4094", make_input("bne a0, a1, -4094\n")))
+    tests.append(("blt off 2", make_input("blt a0, a1, 2\n")))
+
+    # J-type: jal with specific offsets
+    tests.append(("jal off 8", make_input("jal zero, 8\n")))
+
+    # ── Token read edge cases ──
+    # Trigger string/char reading with various escape combos
+    tests.append((".ascii all escapes", make_input(
+        '.ascii "\\n\\t\\r\\0\\\\\\\""\n')))
+    tests.append((".ascii no escape", make_input('.ascii "plain text"\n')))
+    tests.append((".ascii single char", make_input('.ascii "X"\n')))
+
+    # ── Expression eval with subtraction (triggers ep_sub path) ──
+    tests.append(("expr: 100-50", make_input(".equ A, 100\n.word A-50\n")))
+    tests.append(("expr: sym-sym", make_input(
+        "start:\nnop\nend:\n.word end-start\n")))
+
+    # ── Fixup pass edge cases ──
+    # B-type fixup with different branch types
+    for m in ['beq','bne','blt','bge','bltu','bgeu']:
+        tests.append((f"fixup long {m}", make_input(
+            f"{m} a0, a1, target\n" + "nop\n" * 100 + "target:\n")))
+
+    # ── Mixed comprehensive program that hits many paths ──
+    tests.append(("kitchen sink", make_input(
+        "# Kitchen sink test\n"
+        ".equ CONST1, 0x100\n"
+        ".equ CONST2, CONST1+0x50\n"
+        "lui a0, 0x10000\n"
+        "auipc a1, 0\n"
+        "li a2, 0xDEADBEEF\n"
+        "li a3, -12345\n"
+        "addi a4, zero, 'A'\n"
+        "addi a5, zero, '\\n'\n"
+        "addi a6, zero, CONST2\n"
+        "andi a7, a2, 0xFFF\n"
+        "ori t0, zero, 0x800\n"
+        "xori t1, a2, 0xFF\n"
+        "add t2, a0, a1\n"
+        "sub t3, a2, a3\n"
+        "sll t4, a4, a5\n"
+        "srl t5, a4, a5\n"
+        "sra t6, a4, a5\n"
+        "and s0, a0, a1\n"
+        "or s1, a0, a1\n"
+        "xor s2, a0, a1\n"
+        "slt s3, a0, a1\n"
+        "sltu s4, a0, a1\n"
+        "slli s5, a0, 8\n"
+        "srli s6, a0, 16\n"
+        "srai s7, a0, 4\n"
+        "slti s8, a0, -100\n"
+        "sltiu s9, a0, 0xFF\n"
+        "neg s10, a0\n"
+        "not s11, a1\n"
+        "seqz gp, a2\n"
+        "snez tp, a3\n"
+        "sltz t0, a4\n"
+        "sgtz t1, a5\n"
+        "mv t2, a6\n"
+        "nop\n"
+        "sw a0, 0(sp)\n"
+        "sh a1, 4(sp)\n"
+        "sb a2, 8(sp)\n"
+        "sw a3, 2047(sp)\n"
+        "sw a4, -2048(sp)\n"
+        "lw t3, 0(sp)\n"
+        "lh t4, 4(sp)\n"
+        "lb t5, 8(sp)\n"
+        "lhu t6, 4(sp)\n"
+        "lbu s0, 8(sp)\n"
+        "lw s1, 2047(sp)\n"
+        "lw s2, -2048(sp)\n"
+        "0:\n"
+        "beq a0, a1, 0b\n"
+        "bne a0, a1, 0b\n"
+        "blt a0, a1, 0b\n"
+        "bge a0, a1, 0b\n"
+        "bltu a0, a1, 0b\n"
+        "bgeu a0, a1, 0b\n"
+        "beqz a0, 0b\n"
+        "bnez a0, 0b\n"
+        "bltz a0, 0b\n"
+        "bgez a0, 0b\n"
+        "blez a0, 0b\n"
+        "bgt a0, a1, 0b\n"
+        "ble a0, a1, 0b\n"
+        "bgtu a0, a1, 0b\n"
+        "bleu a0, a1, 0b\n"
+        "j 1f\n"
+        "nop\n"
+        "1:\n"
+        "jal ra, 2f\n"
+        "2:\n"
+        "lla a0, data\n"
+        ".byte 'A', 0xFF, 0x00\n"
+        ".word CONST1, CONST2\n"
+        '.ascii "hello\\nworld\\t!\\r\\0"\n'
+        ".zero 16\n"
+        "data:\n"
+        ".word 0x42\n"
+    )))
+
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
     test_pass = 0
     test_total = 0
@@ -2099,7 +2757,7 @@ def main():
         if len(missing) > 20:
             print(f"    ... and {len(missing) - 20} more")
 
-    check(f"branch coverage ≥ 65% ({pct:.1f}%)", pct >= 65.0)
+    check(f"branch coverage ≥ 80% ({pct:.1f}%)", pct >= 80.0)
 
     # ═══════════════════════════════════════════════════════════
     # Summary
