@@ -55,7 +55,8 @@
 # ── Networking ─────────────────────────────────────────────────────────
 .equ	VIO_DEVICE_FEATURES,	0x010
 .equ	CHUNK_SIZE,		1400
-.equ	NET_BATCH_SIZE,		16
+.equ	NET_BATCH_SIZE,		32
+.equ	NET_BATCH_BITMAP,	41088
 .equ	NET_RETRY_MS,		100
 .equ	NET_TIMEOUT_MS,		5000
 .equ	MTIME_FREQ_KHZ,	10000
@@ -638,9 +639,14 @@ num_chunks_done:
 
 	# s3 = current batch start (chunk 0 already received).
 	li	s3, 0
-	# s6 = global chunk bitmap word (for current batch).
-	# Chunk 0 already received — set bit 0.
-	li	s6, 1
+	# Bitmap: 4 words at NET_BATCH_BITMAP. Set bit 0.
+	li	t0, NET_BATCH_BITMAP
+	add	t0, s11, t0
+	li	t1, 1
+	sw	t1, 0(t0)
+	sw	zero, 4(t0)
+	sw	zero, 8(t0)
+	sw	zero, 12(t0)
 
 batch_loop:
 	# Check if we're past the last chunk.
@@ -661,7 +667,12 @@ batch_end_ok:
 	j	batch_check_complete
 
 batch_send:
-	li	s6, 0			# reset bitmap for new batch
+	li	t0, NET_BATCH_BITMAP
+	add	t0, s11, t0
+	sw	zero, 0(t0)
+	sw	zero, 4(t0)
+	sw	zero, 8(t0)
+	sw	zero, 12(t0)
 batch_request:
 	# Send request for s3..s9 to locked seed (s2).
 	mv	a2, s2
@@ -689,13 +700,21 @@ rx_ret_batch:
 
 	# Check bitmap — is this a new chunk?
 	sub	t0, a1, s3		# bit index within batch
+	srli	t1, t0, 5
+	slli	t1, t1, 2
+	li	t2, NET_BATCH_BITMAP
+	add	t2, s11, t2
+	add	t2, t2, t1
+	lw	t3, 0(t2)
+	andi	t4, t0, 31
 	li	t1, 1
-	sll	t1, t1, t0		# bit mask
-	and	t2, s6, t1
-	bnez	t2, batch_ignore	# already have it — don't update timeout
+	sll	t1, t1, t4
+	and	t5, t3, t1
+	bnez	t5, batch_ignore	# already have it
 
 	# New chunk! Set bitmap bit.
-	or	s6, s6, t1
+	or	t3, t3, t1
+	sw	t3, 0(t2)
 
 	# Copy data to endmark + seq * CHUNK_SIZE.
 	# Compute dest = endmark + a1 * 1400.
@@ -754,15 +773,31 @@ repost_ret_chunk:
 	lw	s5, 0(t0)
 
 batch_check_complete:
-	# Check if all bits in batch are set.
-	# Expected mask = (1 << (batch_end - batch_start + 1)) - 1
+	# Check if all bits [0..batch_len-1] are set across 4 words.
 	sub	t0, s9, s3
-	addi	t0, t0, 1		# batch size
+	addi	t0, t0, 1		# batch_len (1..128)
+	li	t2, NET_BATCH_BITMAP
+	add	t2, s11, t2
+bcc_word:
+	# If remaining >= 32, this word must be all-ones.
+	li	t3, 32
+	blt	t0, t3, bcc_partial
+	lw	t3, 0(t2)
+	li	t4, -1
+	bne	t3, t4, batch_recv
+	addi	t0, t0, -32
+	beqz	t0, bcc_done
+	addi	t2, t2, 4
+	j	bcc_word
+bcc_partial:
+	# Last word: check low t0 bits.
+	lw	t3, 0(t2)
 	li	t1, 1
 	sll	t1, t1, t0
-	addi	t1, t1, -1		# expected mask
-	and	t2, s6, t1
-	bne	t2, t1, batch_recv	# not complete yet — keep polling
+	addi	t1, t1, -1
+	and	t3, t3, t1
+	bne	t3, t1, batch_recv
+bcc_done:
 
 	# Batch complete! Advance to next batch.
 	addi	s3, s9, 1
@@ -788,8 +823,32 @@ batch_no_famc:
 	# Check retry interval (100ms = 1,000,000 ticks).
 	li	t2, 1000000
 	blt	t1, t2, batch_recv	# not yet — keep polling
-	# Retry: re-request missing chunks.
-	j	batch_request
+	# Retry: find first missing chunk and request from there.
+	li	t2, NET_BATCH_BITMAP
+	add	t2, s11, t2
+	li	t3, 0			# bit offset
+retry_scan_word:
+	lw	t4, 0(t2)
+	li	t5, -1
+	beq	t4, t5, retry_next_word
+	# Found a word with a zero bit. Find lowest zero.
+	not	t4, t4			# invert: zeros become ones
+retry_scan_bit:
+	andi	t5, t4, 1
+	bnez	t5, retry_found
+	srli	t4, t4, 1
+	addi	t3, t3, 1
+	j	retry_scan_bit
+retry_next_word:
+	addi	t3, t3, 32
+	addi	t2, t2, 4
+	j	retry_scan_word
+retry_found:
+	add	a3, s3, t3		# first missing chunk index
+	mv	a2, s2
+	mv	a4, s9
+	li	gp, 1
+	j	send_famc_req
 
 seed_timeout:
 	# This seed is dead. Count failure.
