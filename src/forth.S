@@ -500,6 +500,24 @@ not_do2:
     bne t3, t1, not_squote2
     j do_squote
 not_squote2:
+    # "w!" = 'w','!'
+    addi t1, zero, 119         # 'w'
+    bne t0, t1, not_wstore2
+    addi t1, zero, 33          # '!'
+    beq t3, t1, emit_wstore
+not_wstore2:
+    # "h!" = 'h','!'
+    addi t1, zero, 104         # 'h'
+    bne t0, t1, not_hstore2
+    addi t1, zero, 33          # '!'
+    beq t3, t1, emit_hstore
+not_hstore2:
+    # "h@" = 'h','@'
+    addi t1, zero, 104         # 'h'
+    bne t0, t1, not_hfetch2
+    addi t1, zero, 64          # '@'
+    beq t3, t1, emit_hfetch
+not_hfetch2:
     j not_len2
 not_len2:
 
@@ -540,7 +558,8 @@ not_xor3:
     addi t1, zero, 101         # 'e'
     bne t3, t1, not_key3
     addi t1, zero, 121         # 'y'
-    beq t4, t1, emit_key
+    bne t4, t1, not_key3
+    j emit_key
 not_key3:
     # "bye" = 'b','y','e'
     addi t1, zero, 98          # 'b'
@@ -548,7 +567,8 @@ not_key3:
     addi t1, zero, 121         # 'y'
     bne t3, t1, not_bye3
     addi t1, zero, 101         # 'e'
-    beq t4, t1, emit_bye
+    bne t4, t1, not_bye3
+    j emit_bye
 not_bye3:
     # "rot" = 'r','o','t'
     addi t1, zero, 114         # 'r'
@@ -556,7 +576,8 @@ not_bye3:
     addi t1, zero, 111         # 'o'
     bne t3, t1, not_rot3
     addi t1, zero, 116         # 't'
-    beq t4, t1, emit_rot
+    bne t4, t1, not_rot3
+    j emit_rot
 not_rot3:
     # "mod" = 'm','o','d'
     addi t1, zero, 109         # 'm'
@@ -697,6 +718,9 @@ not_len4:
     # "leave" starts with 'l'
     addi t1, zero, 108         # 'l'
     beq t0, t1, check_leave
+    # "fence" starts with 'f'
+    addi t1, zero, 102         # 'f'
+    beq t0, t1, check_fence
     j not_len5
 
 check_allot:
@@ -795,6 +819,21 @@ check_leave:
     bne t3, t1, not_leave
     j do_leave
 not_leave:
+    j not_len5
+
+check_fence:
+    lbu t3, 1(s6)
+    addi t1, zero, 101         # 'e'
+    bne t3, t1, not_len5
+    lbu t3, 2(s6)
+    addi t1, zero, 110         # 'n'
+    bne t3, t1, not_len5
+    lbu t3, 3(s6)
+    addi t1, zero, 99          # 'c'
+    bne t3, t1, not_len5
+    lbu t3, 4(s6)
+    addi t1, zero, 101         # 'e'
+    beq t3, t1, emit_fence
     j not_len5
 not_len5:
 
@@ -1400,6 +1439,105 @@ pop_cstore2_cont:
     # addi x20, x20, 4: 0x004A0A13
     lui t0, 0x004A1
     addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- w! (unchecked 32-bit store, for MMIO) ---
+# lw   t0, 0(s4)       value
+# addi s4, s4, 4
+# sw   t0, 0(s3)       store value at addr (TOS)
+# lw   s3, 0(s4)       pop new TOS
+# addi s4, s4, 4
+emit_wstore:
+    addi a0, zero, 49
+    j emit_underflow_check
+pop_wstore1_cont:
+    # lw x5, 0(x20): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw x5, 0(x19): 0x0059A023
+    lui t0, 0x0059A
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    addi a0, zero, 50
+    j emit_underflow_check
+pop_wstore2_cont:
+    # lw x19, 0(x20): 0x000A2983
+    lui t0, 0x000A3
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- h! (unchecked 16-bit store, for MMIO) ---
+# lw   t0, 0(s4)       value
+# addi s4, s4, 4
+# sh   t0, 0(s3)       store halfword at addr (TOS)
+# lw   s3, 0(s4)       pop new TOS
+# addi s4, s4, 4
+emit_hstore:
+    addi a0, zero, 51
+    j emit_underflow_check
+pop_hstore1_cont:
+    # lw x5, 0(x20): 0x000A2283
+    lui t0, 0x000A2
+    addi t0, t0, 0x283
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sh x5, 0(x19): 0x00599023
+    lui t0, 0x00599
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    addi a0, zero, 52
+    j emit_underflow_check
+pop_hstore2_cont:
+    # lw x19, 0(x20): 0x000A2983
+    lui t0, 0x000A3
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- h@ (unsigned 16-bit load) ---
+# lhu  s3, 0(s3)
+emit_hfetch:
+    # lhu x19, 0(x19): 0x0009D983
+    lui t0, 0x0009E
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- fence (full memory barrier) ---
+emit_fence:
+    # fence iorw, iorw: 0x0FF0000F
+    lui t0, 0x0FF00
+    addi t0, t0, 0xF
     sw t0, 0(s3)
     addi s3, s3, 4
     j compile_loop
@@ -3581,7 +3719,17 @@ emit_rt_check:
     beqz a0, rtc46
     addi a0, a0, -1
     beqz a0, rtc47
-    j rtc48
+    addi a0, a0, -1
+    beqz a0, rtc48
+    addi a0, a0, -1
+    beqz a0, rtc49
+    addi a0, a0, -1
+    beqz a0, rtc50
+    addi a0, a0, -1
+    beqz a0, rtc51
+    addi a0, a0, -1
+    beqz a0, rtc52
+    j error_word
 rtc0:
     j push_dup_cont
 rtc1:
@@ -3680,6 +3828,14 @@ rtc47:
     j pop_div_cont
 rtc48:
     j pop_mod_cont
+rtc49:
+    j pop_wstore1_cont
+rtc50:
+    j pop_wstore2_cont
+rtc51:
+    j pop_hstore1_cont
+rtc52:
+    j pop_hstore2_cont
 
 # ============================================================================
 # Error handlers: write error name to word buffer, then fall through/jump to error_word
