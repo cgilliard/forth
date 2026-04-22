@@ -598,23 +598,6 @@ probe_loop:
 	sll	t0, t0, s1
 	and	t0, t1, t0
 	bnez	t0, sfr_ret_probe	# skip failed seed
-	# Debug: print 'P' + seed index.
-	li	t0, UART_BASE
-dbg_pw:	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, dbg_pw
-	li	t1, 80			# 'P'
-	sb	t1, 0(t0)
-dbg_pw2:	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, dbg_pw2
-	addi	t1, s1, 48		# '0' + index
-	sb	t1, 0(t0)
-dbg_pw3:	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, dbg_pw3
-	li	t1, 10			# newline
-	sb	t1, 0(t0)
 	# Compute seed entry address: s7 + s1 * 6
 	slli	t0, s1, 1
 	add	t0, t0, s1
@@ -686,43 +669,6 @@ find_next_seed:
 	j	find_seed
 
 seed_locked:
-	# Debug: print 'L' + seed index.
-	addi	sp, sp, -8
-	sw	a2, 0(sp)
-	sw	t5, 4(sp)
-	li	t0, UART_BASE
-dbg_lw:	lbu	t5, UART_LSR(t0)
-	andi	t5, t5, UART_TX_READY
-	beqz	t5, dbg_lw
-	li	t5, 76			# 'L'
-	sb	t5, 0(t0)
-dbg_lw2:	lbu	t5, UART_LSR(t0)
-	andi	t5, t5, UART_TX_READY
-	beqz	t5, dbg_lw2
-	addi	t5, s1, 48		# '0' + seed index
-	sb	t5, 0(t0)
-	# Print fail mask.
-	li	t5, NET_FAIL_MASK
-	add	t5, s11, t5
-	lhu	t5, 0(t5)
-dbg_lw3:	lbu	a2, UART_LSR(t0)
-	andi	a2, a2, UART_TX_READY
-	beqz	a2, dbg_lw3
-	li	a2, 109			# 'm'
-	sb	a2, 0(t0)
-dbg_lw4:	lbu	a2, UART_LSR(t0)
-	andi	a2, a2, UART_TX_READY
-	beqz	a2, dbg_lw4
-	addi	a2, t5, 48		# '0' + mask value
-	sb	a2, 0(t0)
-dbg_lw5:	lbu	a2, UART_LSR(t0)
-	andi	a2, a2, UART_TX_READY
-	beqz	a2, dbg_lw5
-	li	a2, 10			# newline
-	sb	a2, 0(t0)
-	lw	t5, 4(sp)
-	lw	a2, 0(sp)
-	addi	sp, sp, 8
 	# Check if this seed already failed hash check.
 	li	t0, NET_FAIL_MASK
 	add	t0, s11, t0
