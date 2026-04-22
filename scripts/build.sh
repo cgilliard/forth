@@ -44,7 +44,7 @@ cmp ./bin/fam0 ./fam0.seed || { echo "fam0: binaries don't match!"; exit 1; }
 run bin/fam0 src/fam1.fam0 > bin/fam1
 run bin/fam1 src/fam2.fam1 > bin/fam2
 run bin/fam2 src/fam3.fam2 > bin/fam3
-run bin/fam0 src/forth.fam0 > bin/forth
+run bin/fam3 src/forth.fam3 > bin/forth
 run bin/fam3 src/tabernacle_config.inc src/tabernacle.fam3 > bin/tabernacle
 
 echo "Success!"
