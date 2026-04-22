@@ -1196,6 +1196,19 @@ rx_is_arp:
 	lbu	t0, 33(a2)
 	li	t1, 1
 	bne	t0, t1, rx_unknown
+	# Check target IP matches ours (offset 50..53).
+	lbu	t0, 50(a2)
+	li	t1, GUEST_IP_0
+	bne	t0, t1, rx_unknown
+	lbu	t0, 51(a2)
+	li	t1, GUEST_IP_1
+	bne	t0, t1, rx_unknown
+	lbu	t0, 52(a2)
+	li	t1, GUEST_IP_2
+	bne	t0, t1, rx_unknown
+	lbu	t0, 53(a2)
+	li	t1, GUEST_IP_3
+	bne	t0, t1, rx_unknown
 	li	gp, 0
 	j	send_arp_reply
 sar_ret:
@@ -1915,7 +1928,8 @@ gpd_2:
 	j	gpr_squeeze
 
 dispatch_error:
-	j	dispatch_error
+	li	a0, 69			# 'E'
+	j	emit_code
 
 hash_data:
 	.word	BIN_HASH0

@@ -13,5 +13,6 @@ here 8 - dup @ swap over 3 + -4 and -
 68 emit 97 emit 116 emit 97 emit 58 emit 32 emit
 .20
 49 emit
+10 emit
 
 bye
