@@ -33,7 +33,28 @@ run bin/fam3 src/gen_bin_config.fam3 > bin/gen_bin_config
 
 # Build full_node, append bible data, generate config
 run bin/forth src/full_node.forth > bin/full_node
-tools/append.sh bin/full_node resources/bible.compressed
+
+# Inline append: attach data, pad, length trailer, patch here pointer
+DATA_SIZE=$(wc -c < resources/bible.compressed)
+cat resources/bible.compressed >> bin/full_node
+TOTAL=$(wc -c < bin/full_node)
+PAD=$(( (4 - TOTAL % 4) % 4 ))
+[ "$PAD" -gt 0 ] && dd if=/dev/zero bs=1 count=$PAD >> bin/full_node 2>/dev/null
+le4() { printf "\\$(printf '%03o' $(($1 & 0xFF)))\\$(printf '%03o' $((($1 >> 8) & 0xFF)))\\$(printf '%03o' $((($1 >> 16) & 0xFF)))\\$(printf '%03o' $((($1 >> 24) & 0xFF)))"; }
+le4 "$DATA_SIZE" >> bin/full_node
+
+# Patch auipc/addi at bytes 8-15 so 'here' points past appended data
+FSIZE=$(wc -c < bin/full_node)
+OFFSET=$((FSIZE - 8))
+LOWER=$((OFFSET & 0xFFF))
+[ "$LOWER" -ge 2048 ] && LOWER=$((LOWER - 4096))
+UPPER=$(( (OFFSET - LOWER) & 0xFFFFFFFF ))
+AUIPC=$(( (UPPER & 0xFFFFF000) | (5 << 7) | 0x17 ))
+ADDI=$(( ((LOWER & 0xFFF) << 20) | (5 << 15) | (5 << 7) | 0x13 ))
+le4 "$AUIPC" | dd of=bin/full_node bs=1 seek=8 count=4 conv=notrunc 2>/dev/null
+le4 "$ADDI" | dd of=bin/full_node bs=1 seek=12 count=4 conv=notrunc 2>/dev/null
+echo "Appended $DATA_SIZE bytes to bin/full_node ($FSIZE bytes total)" >&2
+
 cp bin/full_node tmp/full_node.bin
 SIZE=$(wc -c < tmp/full_node.bin)
 printf "\\$(printf '%03o' $((SIZE & 0xFF)))\\$(printf '%03o' $(((SIZE >> 8) & 0xFF)))\\$(printf '%03o' $(((SIZE >> 16) & 0xFF)))\\$(printf '%03o' $(((SIZE >> 24) & 0xFF)))" > tmp/full_node.img
