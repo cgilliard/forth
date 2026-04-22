@@ -51,6 +51,7 @@
 .equ	MAX_SEEDS,		16
 .equ	RX_PROC_IDX,		40944
 .equ	NET_FAIL_CNT,		40946
+.equ	NET_FAIL_MASK,		40948
 
 # ── Networking ─────────────────────────────────────────────────────────
 .equ	VIO_DEVICE_FEATURES,	0x010
@@ -58,7 +59,7 @@
 .equ	NET_BATCH_SIZE,		32
 .equ	NET_BATCH_BITMAP,	41088
 .equ	NET_RETRY_MS,		100
-.equ	NET_TIMEOUT_MS,		5000
+.equ	NET_TIMEOUT_MS,		10000
 .equ	MTIME_FREQ_KHZ,	10000
 
 # Net memory layout (offsets from s11, reuses disk queue region).
@@ -321,6 +322,10 @@ ch_ret_disk:
 	j	exec_binary
 
 disk_hash_fail:
+	li	a0, 72			# 'H' = hash mismatch
+	li	gp, 0
+	j	emit_warn
+ew_ret_disk:
 disk_error:
 no_disk:
 	j	scan_net
@@ -336,6 +341,27 @@ exec_binary:
 	lw	a4, 0(t0)
 	mv	a5, s4
 	j	endmark
+
+emit_warn:
+	li	t0, UART_BASE
+ew_wait:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ew_wait
+	sb	a0, 0(t0)
+ew_nl:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ew_nl
+	li	t1, 10
+	sb	t1, 0(t0)
+ew_disp:
+	beqz	gp, ew_ret_disk
+	li	t0, 1
+	beq	gp, t0, ew_ret_net
+	li	t0, 2
+	beq	gp, t0, ew_ret_timeout
+	j	dispatch_error
 
 emit_code:
 	li	t0, UART_BASE
@@ -491,6 +517,11 @@ rx_desc_done:
 	lbu	s8, 0(s7)		# s8 = seed count
 	beqz	s8, no_net		# no seeds configured
 	addi	s7, s7, 1		# skip count byte → first entry
+	# Clear fail state.
+	li	t0, NET_FAIL_CNT
+	add	t0, s11, t0
+	sh	zero, 0(t0)		# fail count = 0
+	sh	zero, 2(t0)		# fail mask = 0
 	# s9 = starting index = mtime % seed_count
 	li	t0, MTIME_ADDR
 	lw	t0, 0(t0)
@@ -538,15 +569,11 @@ rx_ret_probe:
 	li	t0, 2
 	beq	a0, t0, probe_got_response
 
-	# Check timeout (5 seconds).
+	# Check timeout (10 seconds).
 	li	t0, MTIME_ADDR
 	lw	t0, 0(t0)
 	sub	t1, t0, s5
-	li	t2, NET_TIMEOUT_MS
-	li	t3, MTIME_FREQ_KHZ
-	# t2 = timeout in ticks = NET_TIMEOUT_MS * MTIME_FREQ_KHZ
-	# But that's 5000 * 10000 = 50,000,000 = 0x02FAF080
-	li	t2, 0x02FAF080
+	li	t2, 0x05F5E100		# 10s = 100,000,000 ticks
 	blt	t1, t2, probe_poll
 	# Timeout — no seeds responded.
 	j	no_net
@@ -582,10 +609,34 @@ find_next_seed:
 	j	find_seed
 
 seed_locked:
-	# Reset fail counter.
-	li	t0, NET_FAIL_CNT
+	# Check if this seed already failed hash check.
+	li	t0, NET_FAIL_MASK
 	add	t0, s11, t0
-	sh	zero, 0(t0)
+	lhu	t1, 0(t0)
+	li	t2, 1
+	sll	t2, t2, s1		# bit for this seed
+	and	t3, t1, t2
+	bnez	t3, probe_skip_bad
+	j	seed_ok
+
+probe_skip_bad:
+	# This seed sent bad data before. Repost RX buf and keep polling.
+	li	gp, 6
+	j	repost_rx
+repost_ret_skip_bad:
+	# Check if ALL seeds are marked bad.
+	li	t0, NET_FAIL_MASK
+	add	t0, s11, t0
+	lhu	t1, 0(t0)
+	# Build mask with s8 bits set: (1 << seed_count) - 1
+	li	t2, 1
+	sll	t2, t2, s8
+	addi	t2, t2, -1
+	and	t3, t1, t2
+	beq	t3, t2, no_net		# all seeds failed hash
+	j	probe_poll		# keep waiting for a good seed
+
+seed_ok:
 	# s1 = locked seed index, s2 = locked seed entry ptr.
 	# We already received chunk 0 from the probe response.
 	# Copy chunk 0 data to endmark.
@@ -816,8 +867,8 @@ batch_no_famc:
 	lw	t0, 0(t0)
 	sub	t1, t0, s5
 
-	# Check seed timeout (5 seconds).
-	li	t2, 0x02FAF080		# NET_TIMEOUT_MS * MTIME_FREQ_KHZ
+	# Check seed timeout (10 seconds).
+	li	t2, 0x05F5E100		# NET_TIMEOUT_MS * MTIME_FREQ_KHZ
 	bge	t1, t2, seed_timeout
 
 	# Check retry interval (100ms = 1,000,000 ticks).
@@ -851,27 +902,28 @@ retry_found:
 	j	send_famc_req
 
 seed_timeout:
-	# This seed is dead. Count failure.
-	li	t0, NET_FAIL_CNT
+	# This seed is dead. Mark it in the fail mask.
+	li	t0, NET_FAIL_MASK
 	add	t0, s11, t0
 	lhu	t1, 0(t0)
-	addi	t1, t1, 1
+	li	t2, 1
+	sll	t2, t2, s1
+	or	t1, t1, t2
 	sh	t1, 0(t0)
-	bge	t1, s8, no_net
-	# Advance to next seed.
-	addi	s1, s1, 1
-	blt	s1, s8, next_seed_ok
-	li	s1, 0
-next_seed_ok:
-	# Compute new seed entry ptr.
-	slli	t0, s1, 1
-	add	t0, t0, s1
-	slli	t0, t0, 1
-	add	s2, s7, t0
-	# Reset download — start from chunk 0.
-	li	s3, 0
-	li	s6, 0
-	j	batch_send
+	# Check if all seeds have failed.
+	li	t2, 1
+	sll	t2, t2, s8
+	addi	t2, t2, -1
+	and	t3, t1, t2
+	beq	t3, t2, no_net		# all seeds exhausted
+	# Emit 'T' for timeout, then re-probe.
+	li	a0, 84			# 'T'
+	li	gp, 2
+	j	emit_warn
+ew_ret_timeout:
+	li	s1, 0			# start from seed 0
+	mv	s2, s8			# remaining = seed count
+	j	probe_loop
 
 download_complete:
 	# Hash the downloaded binary.
@@ -892,8 +944,22 @@ ch_ret_net:
 	j	exec_binary
 
 net_hash_fail:
-	# This seed sent bad data. Try next seed.
-	j	seed_timeout
+	# Mark this seed as bad in the fail mask.
+	li	t0, NET_FAIL_MASK
+	add	t0, s11, t0
+	lhu	t1, 0(t0)
+	li	t2, 1
+	sll	t2, t2, s1		# bit for current seed
+	or	t1, t1, t2
+	sh	t1, 0(t0)
+	li	a0, 72			# 'H' = hash mismatch
+	li	gp, 1
+	j	emit_warn
+ew_ret_net:
+	# Re-enter probe phase — blast all seeds again, skip bad ones.
+	li	s1, 0			# start from seed 0
+	mv	s2, s8			# remaining = seed count
+	j	probe_loop
 
 # ══════════════════════════════════════════════════════════════════════════
 # rx_poll -- check for a received packet, handle ARP, detect FAMC.
@@ -1033,7 +1099,7 @@ rxd_1:
 #   a3 = descriptor index to repost
 #   Dispatch: gp=1→repost_ret_probe, gp=2→repost_ret_chunk,
 #             gp=3→repost_ret_ignore, gp=4→repost_ret_arp,
-#             gp=5→repost_ret_unknown
+#             gp=5→repost_ret_unknown, gp=6→repost_ret_skip_bad
 # ══════════════════════════════════════════════════════════════════════════
 repost_rx:
 	li	t0, NET_RX_QUEUE
@@ -1063,6 +1129,8 @@ repost_rx_disp:
 	beq	gp, t0, repost_ret_arp
 	li	t0, 5
 	beq	gp, t0, repost_ret_unknown
+	li	t0, 6
+	beq	gp, t0, repost_ret_skip_bad
 	j	dispatch_error
 
 # ══════════════════════════════════════════════════════════════════════════
