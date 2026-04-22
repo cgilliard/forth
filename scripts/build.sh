@@ -1,20 +1,4 @@
 #!/usr/bin/sh
-# Bootstrap build. Each stage compiles the next from source using only the
-# previous stage's binary. Nothing here depends on anything except QEMU —
-# no python, no external assemblers, no libc.
-#
-# Stages:
-#   fam0 → fam1 → fam2 → fam3 → famc    (compiler toolchain)
-#   gen_bin_config                      (gimli-hash config generator;
-#                                        reads full_node from virtio-blk)
-#   full_node                           (the node image, compiled from
-#                                        src/full_node.fam via famc)
-#   tabernacle                          (node loader, assembled by fam3
-#                                        against the current bin_config.inc)
-#
-# Usage: run <assembler> [--disk <image>] <source...>
-# Multiple source files are concatenated before piping to the assembler.
-# --disk attaches a raw disk image via virtio-blk.
 set -e
 
 CPU="rv32,m=false,a=false,f=false,d=false,c=false,\

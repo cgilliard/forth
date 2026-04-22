@@ -11,7 +11,10 @@ Layers of verification (modeled after proofs/fam0.py):
     Pure RV32I only: no JALR, no SYSTEM, no FENCE, no M/A/F/D/C extensions.
 
   Layer 2 — Exhaustive store enumeration
-    Every sw/sb in the binary has its base register and target verified.
+    Every sw/sb in the compiler binary has its base register and target
+    verified against the compiler's memory map. Store protection for other
+    binaries (tabernacle, full_node) is proven in their own proof files,
+    where allowed regions include virtio MMIO and DMA buffers.
 
   Layer 3 — Branch target verification
     Every branch/jump target is in-range and 4-byte aligned.
@@ -485,7 +488,9 @@ def main():
     # ═══════════════════════════════════════════════════════════
     print("\n[2b] Concrete store address bounds (all stores hit designated regions)")
 
-    # Memory map for the compiler:
+    # Memory map for the compiler binary only. Other binaries (tabernacle,
+    # full_node) have their own proofs with additional regions for virtio
+    # MMIO and DMA buffers.
     STORE_REGIONS = [
         ("input buffer",   0x83000000, 0x84000000),
         ("output buffer",  0x84000000, 0x85000000),
@@ -974,6 +979,22 @@ def main():
     #  13. emit_literal:   addi x19,x19 → (lo << 20) | 0x98993
     #  14. disp_done:      jal x0, 0    → 0x6F (constant, already checked)
     #  15. do_colon:       jal x0, 0    → 0x6F (constant, already checked)
+    #  16. PIC auipc x5:   (up << 12) | 0x297     → opcode 0x17
+    #  17. PIC addi x5,x5: (lo << 20) | 0x28293   → opcode 0x13
+    #  18. s" len addi:    (len << 20) | 0x993     → same as path 11
+    #
+    # Non-t0 emissions (via a1):
+    #  19. emit_rt_check:  sw a1, 0(s3) — 6 constant bltu instructions
+    #
+    # Patch-site emissions (write to 0(t2) or 0(t4), not 0(s3)):
+    #  20. do_then beq patch:   B-type | 0x63 (covered by B-type proof)
+    #  21. patch_jal:            J-type | 0x6F (covered by J-type proof)
+    #  22. do_else beq patch:    B-type | 0x63 (covered by B-type proof)
+    #  23. do_while beq patch:   B-type | 0x63 (covered by B-type proof)
+    #  24. loop leave patches:   J-type | 0x6F (covered by J-type proof)
+    #  25. sq_aligned jal patch: J-type | 0x6F (covered by J-type proof)
+    #  26. colon fwd jal patch:  J-type | 0x6F (covered by J-type proof)
+    #  27. patch_loop jal:       J-type | 0x6F (covered by J-type proof)
     print("\n  [6b] Dynamic instruction construction: Z3 opcode proof")
 
     s10 = BitVec('s10', 32)
@@ -1028,6 +1049,34 @@ def main():
     str_auipc = (str_upper << 12) | C(0x00000097 | (19 << 7))
     prove("s\" auipc x19: opcode = 0x17 (never 0x67)",
           ForAll([str_upper], Extract(6, 0, str_auipc) == 0x17))
+
+    # PIC auipc x5: (upper20 << 12) | 0x297
+    pic_upper = BitVec('pic_upper', 32)
+    pic_auipc = (pic_upper << 12) | C(0x297)
+    prove("PIC auipc x5: opcode = 0x17 (never 0x67)",
+          ForAll([pic_upper], Extract(6, 0, pic_auipc) == 0x17))
+
+    # PIC addi x5, x5: (lower12 << 20) | 0x28293
+    pic_lower = BitVec('pic_lower', 32)
+    pic_addi = (pic_lower << 20) | C(0x28293)
+    prove("PIC addi x5,x5: opcode = 0x13 (never 0x67)",
+          ForAll([pic_lower], Extract(6, 0, pic_addi) == 0x13))
+
+    # emit_rt_check: sw a1, 0(s3) where a1 holds constant bltu instructions.
+    # Each caller loads a1 via lui+addi with a fixed value.
+    rt_check_constants = {
+        "emit_shadow_underflow_check": (0x012D6, 0x463),
+        "emit_heap_check":             (0x0169E, 0x463),
+        "emit_underflow_check":        (0x017A6, 0x463),
+        "emit_store_check":            (0x0199F, 0x463),
+        "emit_stk_check":              (0x014B6, 0x463),
+        "emit_shadow_check":           (0x01896, 0x463),
+    }
+    for name, (upper, lower) in rt_check_constants.items():
+        val = ((upper << 12) + lower) & 0xFFFFFFFF
+        opcode = val & 0x7F
+        check(f"{name}: a1=0x{val:08X} opcode=0x{opcode:02X} (not 0x67)",
+              opcode != 0x67)
 
     print("\n  Dynamic paths produce only opcodes {0x13, 0x17, 0x37, 0x63, 0x6F}.")
     print("  0x67 (JALR/JR/RET) is structurally impossible.")
@@ -2091,7 +2140,7 @@ def main():
     print(f"    → initialization + output + shutdown verified from bit fields")
     print(f"    → NO-JALR proof for compiled output (3 layers):")
     print(f"        [6a] static constants: all {len(emitted_vals)} emitted words checked")
-    print(f"        [6b] Z3: 7 dynamic code paths proven opcode ≠ 0x67")
+    print(f"        [6b] Z3: 9 dynamic code paths + 6 rt-check constants proven opcode ≠ 0x67")
     print(f"        [6c] concrete: {total_output_words} output words across {len(jalr_scan_programs)} programs scanned")
     print(f"    → concrete e2e: sim vs QEMU {'(compared)' if qemu_available else '(QEMU not available)'}")
     print(f"    → hello program: sim vs QEMU")
