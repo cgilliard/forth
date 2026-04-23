@@ -166,6 +166,93 @@ class FamcServer:
                                + struct.pack('>H', seq) + self.chunks[seq])
                     self.sock.sendto(payload, addr)
 
+
+class NoisyFamcServer(FamcServer):
+    """FAMC server that injects junk packets between real responses."""
+
+    def _serve(self):
+        junk_packets = [
+            b'\x00' * 50,                          # zeros
+            b'FAMC\x99' + b'\x00' * 20,            # bad FAMC command
+            b'NOT_FAMC' + b'\xff' * 100,            # random garbage
+            b'\xff' * 1400,                         # max-size noise
+            b'FAMC\x82' + b'\xff\xff' + b'\x00',   # truncated FAMC response
+        ]
+        junk_idx = 0
+        while not self._stop:
+            try:
+                pkt, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            if len(pkt) < 9 or pkt[:4] != b'FAMC':
+                continue
+            cmd = pkt[4]
+            if cmd == 0x02:
+                start, end = struct.unpack('>HH', pkt[5:9])
+                self.request_log.append((start, end, addr))
+                for seq in range(start, min(end + 1, len(self.chunks))):
+                    # Send junk before every other real chunk
+                    if seq % 2 == 0:
+                        self.sock.sendto(junk_packets[junk_idx % len(junk_packets)], addr)
+                        junk_idx += 1
+                    payload = (b'FAMC' + bytes([0x82])
+                               + struct.pack('>H', seq) + self.chunks[seq])
+                    self.sock.sendto(payload, addr)
+
+
+class ReplayFamcServer(FamcServer):
+    """FAMC server that only ever sends chunk 0 — DoS simulation."""
+
+    def _serve(self):
+        while not self._stop:
+            try:
+                pkt, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            if len(pkt) < 9 or pkt[:4] != b'FAMC':
+                continue
+            cmd = pkt[4]
+            if cmd == 0x02:
+                start, end = struct.unpack('>HH', pkt[5:9])
+                self.request_log.append((start, end, addr))
+                # Always send chunk 0 regardless of what was requested
+                payload = (b'FAMC' + bytes([0x82])
+                           + struct.pack('>H', 0) + self.chunks[0])
+                for _ in range(min(end - start + 1, 32)):
+                    self.sock.sendto(payload, addr)
+
+
+import random
+
+class ReorderFamcServer(FamcServer):
+    """FAMC server that sends chunks out of order with duplicates."""
+
+    def _serve(self):
+        rng = random.Random(42)
+        while not self._stop:
+            try:
+                pkt, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            if len(pkt) < 9 or pkt[:4] != b'FAMC':
+                continue
+            cmd = pkt[4]
+            if cmd == 0x02:
+                start, end = struct.unpack('>HH', pkt[5:9])
+                self.request_log.append((start, end, addr))
+                seqs = list(range(start, min(end + 1, len(self.chunks))))
+                # Shuffle order
+                rng.shuffle(seqs)
+                # Duplicate ~25% of chunks
+                dupes = rng.sample(seqs, max(1, len(seqs) // 4))
+                seqs.extend(dupes)
+                rng.shuffle(seqs)
+                for seq in seqs:
+                    payload = (b'FAMC' + bytes([0x82])
+                               + struct.pack('>H', seq) + self.chunks[seq])
+                    self.sock.sendto(payload, addr)
+
+
 # ═══════════════════════════════════════════════════════════════
 # QEMU runner
 # ═══════════════════════════════════════════════════════════════
@@ -525,6 +612,69 @@ def test_seed_failover():
         os.unlink(disk)
 
 
+def test_junk_traffic():
+    """Server injects junk packets between real FAMC responses."""
+    print("\n[15] Junk traffic: download succeeds despite noise")
+
+    srv = NoisyFamcServer(DRIVER_BIN)
+    srv.start()
+    disk = make_disk()
+    try:
+        stdin = f'1234 2000 10.0.2.2:{srv.port}\x04'
+        out, rc, elapsed = run_tabernacle(stdin, timeout_s=45, disk_path=disk)
+
+        check("exit code 0", rc == 0)
+        check("output contains data hash (successful download)",
+              "Data:" in out)
+        check("a1=1 (net boot)", "a1: 00 00 00 01" in out)
+        check("server received requests", len(srv.request_log) > 0)
+    finally:
+        srv.stop()
+        os.unlink(disk)
+
+
+def test_replay_dos():
+    """Server replays chunk 0 forever — should still timeout."""
+    print("\n[16] Replay DoS: server sends same chunk, timeout fires")
+
+    srv = ReplayFamcServer(DRIVER_BIN)
+    srv.start()
+    disk = make_disk()
+    try:
+        stdin = f'1234 2000 10.0.2.2:{srv.port}\x04'
+        out, rc, elapsed = run_tabernacle(stdin, timeout_s=15, disk_path=disk)
+
+        check("exit code 0 (clean shutdown)", rc == 0)
+        check("output contains N (seed exhausted)", 'N' in out)
+        check("no successful boot", 'Data:' not in out)
+        check("completed in under 10s", elapsed < 10)
+        check("took at least 1.5s (not instant)", elapsed > 1.5)
+    finally:
+        srv.stop()
+        os.unlink(disk)
+
+
+def test_reordered_chunks():
+    """Server sends chunks out of order with duplicates."""
+    print("\n[17] Reordered/duplicate chunks: download succeeds")
+
+    srv = ReorderFamcServer(DRIVER_BIN)
+    srv.start()
+    disk = make_disk()
+    try:
+        stdin = f'1234 2000 10.0.2.2:{srv.port}\x04'
+        out, rc, elapsed = run_tabernacle(stdin, timeout_s=45, disk_path=disk)
+
+        check("exit code 0", rc == 0)
+        check("output contains data hash (successful download)",
+              "Data:" in out)
+        check("a1=1 (net boot)", "a1: 00 00 00 01" in out)
+        check("server received requests", len(srv.request_log) > 0)
+    finally:
+        srv.stop()
+        os.unlink(disk)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
@@ -557,6 +707,9 @@ if __name__ == '__main__':
     test_mixed_seeds()
     test_net_boot_a1()
     test_seed_failover()
+    test_junk_traffic()
+    test_replay_dos()
+    test_reordered_chunks()
 
     print("\n" + "=" * 60)
     total = passed + failed
