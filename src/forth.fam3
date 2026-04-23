@@ -94,7 +94,7 @@ read_done:
     # tp = inside-definition flag (0 = not inside a colon definition)
     addi tp, zero, 0
 
-    # Emit PIC prologue for compiled program (17 words, patched at bye):
+    # Emit PIC prologue for compiled program (25 words, patched at bye):
     # word 0: nop (magic)
     # word 1: lui s5, 0x10000 (UART, absolute hw addr)
     # word 2: auipc t0, <upper20>  (placeholder, patched at bye)
@@ -112,7 +112,8 @@ read_done:
     # word 13: add s8, t0, t1      (s8 = here+73MB, shadow upper limit)
     # word 14: addi t1, t0, 4      (t1 = here+4, heap start)
     # word 15: sw t1, 0(t0)        (mem[here] = here+4, init heap pointer)
-    # word 16: jal x0, +64         (skip 15-instruction error handler)
+    # words 16-23: sw a0..a7, 0..28(s6)   (save boot registers in guard zone)
+    # word 24: jal x0, +64         (skip 15-instruction error handler)
 
     # word 0: nop = 0x00000013
     addi t0, zero, 0x13
@@ -208,7 +209,49 @@ read_done:
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # word 16: jal x0, +64 (skip 15-instruction error handler) = 0x0400006F
+    # words 16-23: save boot registers a0-a7 at s6+0..s6+28 (guard zone)
+    # sw a0, 0(s6) = 0x00AB2023
+    lui t0, 0x00AB2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw a1, 4(s6) = 0x00BB2223
+    lui t0, 0x00BB2
+    addi t0, t0, 0x223
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw a2, 8(s6) = 0x00CB2423
+    lui t0, 0x00CB2
+    addi t0, t0, 0x423
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw a3, 12(s6) = 0x00DB2623
+    lui t0, 0x00DB2
+    addi t0, t0, 0x623
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw a4, 16(s6) = 0x00EB2823
+    lui t0, 0x00EB3
+    addi t0, t0, -0x7DD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw a5, 20(s6) = 0x00FB2A23
+    lui t0, 0x00FB3
+    addi t0, t0, -0x5DD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw a6, 24(s6) = 0x010B2C23
+    lui t0, 0x010B3
+    addi t0, t0, -0x3DD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw a7, 28(s6) = 0x011B2E23
+    lui t0, 0x011B3
+    addi t0, t0, -0x1DD
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 24: jal x0, +64 (skip 15-instruction error handler) = 0x0400006F
     lui t0, 0x04000
     addi t0, t0, 0x06F
     sw t0, 0(s3)
@@ -692,6 +735,19 @@ not_exit4:
     bne t5, t1, not_loop4
     j do_loop
 not_loop4:
+    # "__aX" = '_','_','a','0'-'7' (boot registers)
+    addi t1, zero, 95          # '_'
+    bne t0, t1, not_boot4
+    bne t3, t1, not_boot4
+    addi t1, zero, 97          # 'a'
+    bne t4, t1, not_boot4
+    addi t1, zero, 48          # '0'
+    blt t5, t1, not_boot4
+    addi t1, zero, 56          # '8'
+    bge t5, t1, not_boot4
+    addi t5, t5, -48           # digit = t5 - '0'
+    j emit_boot_reg
+not_boot4:
     j not_len4
 not_len4:
 
@@ -1639,6 +1695,34 @@ emit_negate:
     # sub x19, x0, x19: 0x413009B3
     lui t0, 0x41301        # bit11 of 9B3=1, +1
     addi t0, t0, -0x64D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- __a0..__a7 (push boot register value) ---
+# t5 = digit (0-7). Emits: push TOS, lw s3, -(digit+1)*4(s9)
+emit_boot_reg:
+    addi a0, zero, 53
+    addi a2, t5, 0
+    j emit_stk_check
+push_boot_cont:
+    addi t5, a2, 0
+    # addi x20, x20, -4: 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw x19, 0(x20): 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # lw x19, offset(x22) where offset = t5*4
+    slli t5, t5, 2           # t5 = digit*4
+    slli t5, t5, 20          # shift imm to bits [31:20]
+    lui t0, 0x000B3
+    addi t0, t0, -0x67D      # 0x000B2983 = lw x19, 0(x22)
+    or t0, t0, t5            # merge immediate
     sw t0, 0(s3)
     addi s3, s3, 4
     j compile_loop
@@ -3729,6 +3813,8 @@ emit_rt_check:
     beqz a0, rtc51
     addi a0, a0, -1
     beqz a0, rtc52
+    addi a0, a0, -1
+    beqz a0, rtc53
     j error_word
 rtc0:
     j push_dup_cont
@@ -3836,6 +3922,8 @@ rtc51:
     j pop_hstore1_cont
 rtc52:
     j pop_hstore2_cont
+rtc53:
+    j push_boot_cont
 
 # ============================================================================
 # Error handlers: write error name to word buffer, then fall through/jump to error_word
