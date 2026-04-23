@@ -70,26 +70,32 @@ def qemu_build(asm_path, *src_files):
     return r.stdout
 
 
+DRIVER_PAD_SIZE = 150000
+
 def build_test_artifacts():
     """Build test driver binary and matching tabernacle."""
-    global DRIVER_BIN, DRIVER_DATA_HASH, TABERNACLE_BIN
+    global DRIVER_BIN, TABERNACLE_BIN
 
     tmp_dir = os.path.join(BASE, 'tmp')
     os.makedirs(tmp_dir, exist_ok=True)
 
     print("Building test driver...")
-    driver_path = os.path.join(tmp_dir, 'test_driver')
-    DRIVER_BIN = qemu_build(
+    raw = qemu_build(
         os.path.join(BASE, 'bin', 'forth'),
         os.path.join(BASE, 'tests', 'driver.forth'),
     )
+    # Pad to force multi-batch downloads (32 chunks/batch * 1400 bytes = 44800/batch)
+    DRIVER_BIN = raw + b'\x00' * (DRIVER_PAD_SIZE - len(raw))
+    chunks = (len(DRIVER_BIN) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    batches = (chunks + 31) // 32
+
+    driver_path = os.path.join(tmp_dir, 'test_driver')
     with open(driver_path, 'wb') as f:
         f.write(DRIVER_BIN)
 
     h = gimli_hash(DRIVER_BIN)
     words = struct.unpack('<8I', h)
 
-    # Extract data hash for test assertions (first 4 bytes of gimli hash)
     config_path = os.path.join(tmp_dir, 'test_tabernacle_config.inc')
     with open(config_path, 'w') as f:
         f.write(f".equ\tBIN_SIZE,\t\t{len(DRIVER_BIN)}\n")
@@ -107,7 +113,7 @@ def build_test_artifacts():
     with open(TABERNACLE_BIN, 'wb') as f:
         f.write(tab_data)
 
-    print(f"  driver: {len(DRIVER_BIN)} bytes, hash: {h[:4].hex()}")
+    print(f"  driver: {len(DRIVER_BIN)} bytes ({chunks} chunks, {batches} batches)")
     print(f"  tabernacle: {len(tab_data)} bytes")
 
 
