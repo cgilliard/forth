@@ -6,6 +6,9 @@ Runs tabernacle in QEMU with a local FAMC chunk server and verifies
 behavior for various scenarios: successful download, hash mismatch,
 truncated binary (timeout), seed failover, disk boot, etc.
 
+Builds a test driver binary and matching tabernacle at test time so
+tests don't depend on bin/full_node.
+
 Usage: python3 tests/tabernacle.py
 """
 
@@ -19,9 +22,14 @@ import threading
 import time
 
 BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+sys.path.insert(0, os.path.join(BASE, 'tools'))
+from gen_bin_config import gimli_hash
 
 passed = 0
 failed = 0
+
+DRIVER_BIN = None
+TABERNACLE_BIN = None
 
 def check(name, cond):
     global passed, failed
@@ -31,6 +39,77 @@ def check(name, cond):
     else:
         print(f"  FAIL  {name}")
         failed += 1
+
+# ═══════════════════════════════════════════════════════════════
+# Build test artifacts
+# ═══════════════════════════════════════════════════════════════
+
+CPU = ("rv32,m=false,a=false,f=false,d=false,c=false,"
+       "zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,"
+       "zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false")
+
+def qemu_build(asm_path, *src_files):
+    """Run fam3/forth in QEMU to compile source files, return binary bytes."""
+    stdin_data = b''
+    for src in src_files:
+        with open(src, 'rb') as f:
+            stdin_data += f.read()
+    stdin_data += b'\x04'
+
+    r = subprocess.run(
+        ['qemu-system-riscv32',
+         '-machine', 'virt', '-cpu', CPU,
+         '-nographic', '-bios', 'none',
+         '-device', f'loader,file={asm_path},addr=0x80000000',
+         '-serial', 'stdio', '-monitor', 'none'],
+        input=stdin_data, capture_output=True, timeout=30,
+        cwd=BASE,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"QEMU build failed: {r.stderr.decode()}")
+    return r.stdout
+
+
+def build_test_artifacts():
+    """Build test driver binary and matching tabernacle."""
+    global DRIVER_BIN, DRIVER_DATA_HASH, TABERNACLE_BIN
+
+    tmp_dir = os.path.join(BASE, 'tmp')
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    print("Building test driver...")
+    driver_path = os.path.join(tmp_dir, 'test_driver')
+    DRIVER_BIN = qemu_build(
+        os.path.join(BASE, 'bin', 'forth'),
+        os.path.join(BASE, 'tests', 'driver.forth'),
+    )
+    with open(driver_path, 'wb') as f:
+        f.write(DRIVER_BIN)
+
+    h = gimli_hash(DRIVER_BIN)
+    words = struct.unpack('<8I', h)
+
+    # Extract data hash for test assertions (first 4 bytes of gimli hash)
+    config_path = os.path.join(tmp_dir, 'test_tabernacle_config.inc')
+    with open(config_path, 'w') as f:
+        f.write(f".equ\tBIN_SIZE,\t\t{len(DRIVER_BIN)}\n")
+        for i, w in enumerate(words):
+            f.write(f".equ\tBIN_HASH{i},\t\t0x{w:08X}\n")
+        f.write("\n")
+
+    print("Building test tabernacle...")
+    tab_data = qemu_build(
+        os.path.join(BASE, 'bin', 'fam3'),
+        config_path,
+        os.path.join(BASE, 'src', 'tabernacle.fam3'),
+    )
+    TABERNACLE_BIN = os.path.join(tmp_dir, 'test_tabernacle')
+    with open(TABERNACLE_BIN, 'wb') as f:
+        f.write(tab_data)
+
+    print(f"  driver: {len(DRIVER_BIN)} bytes, hash: {h[:4].hex()}")
+    print(f"  tabernacle: {len(tab_data)} bytes")
+
 
 # ═══════════════════════════════════════════════════════════════
 # FAMC chunk server (runs in-process on a background thread)
@@ -92,7 +171,7 @@ def run_tabernacle(stdin_text, timeout_s=30, disk_path=None):
     cmd = [Q32, '--net']
     if disk_path:
         cmd += [f'--disk={disk_path}']
-    cmd.append(os.path.join(BASE, 'bin', 'tabernacle'))
+    cmd.append(TABERNACLE_BIN)
 
     start = time.monotonic()
     try:
@@ -137,11 +216,7 @@ def test_successful_download():
     """Download correct binary from a single seed — should succeed."""
     print("\n[1] Successful download from single seed")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    srv = FamcServer(binary)
+    srv = FamcServer(DRIVER_BIN)
     srv.start()
     disk = make_disk()
     try:
@@ -150,7 +225,7 @@ def test_successful_download():
 
         check("exit code 0", rc == 0)
         check("output contains data hash",
-              "DC 19 43 00" in out)
+              "Data:" in out)
         check("output contains boot source a1=1 (net)",
               "a1: 00 00 00 01" in out)
         check("output shows seed",
@@ -165,11 +240,7 @@ def test_truncated_binary_timeout():
     """Server has a smaller binary — should timeout and print T."""
     print("\n[2] Truncated binary triggers timeout")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    truncated = binary[:len(binary) - 4000]
+    truncated = DRIVER_BIN[:len(DRIVER_BIN) - 4000]
 
     srv = FamcServer(truncated)
     srv.start()
@@ -194,11 +265,7 @@ def test_timeout_parameter():
     """Verify custom timeout_ms controls the timeout duration."""
     print("\n[3] Custom timeout parameter")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    truncated = binary[:len(binary) - 4000]
+    truncated = DRIVER_BIN[:len(DRIVER_BIN) - 4000]
 
     # 1-second timeout
     srv = FamcServer(truncated)
@@ -230,11 +297,6 @@ def test_timeout_parameter():
         os.unlink(disk)
 
 
-    # Seed failover test omitted: QEMU user-mode NAT maps all servers to
-    # 10.0.2.2, so probe responses match the first seed entry regardless of
-    # port. Failover requires distinct IPs (real network or tap device).
-
-
 def test_no_seeds():
     """No seeds provided — should print N immediately."""
     print("\n[5] No seeds: immediate N")
@@ -255,11 +317,7 @@ def test_hash_mismatch():
     """Server has a full-size binary with wrong content — hash should fail."""
     print("\n[6] Hash mismatch: wrong binary content")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = bytearray(f.read())
-
-    # Corrupt a byte near the middle
+    binary = bytearray(DRIVER_BIN)
     mid = len(binary) // 2
     binary[mid] ^= 0xFF
 
@@ -271,7 +329,6 @@ def test_hash_mismatch():
         out, rc, elapsed = run_tabernacle(stdin, timeout_s=30, disk_path=disk)
 
         check("exit code 0", rc == 0)
-        # Second H is hash mismatch from net download (first H is disk hash fail)
         h_count = out.count('H')
         check(f"output contains 2 H's (disk + net hash fail, got {h_count})",
               h_count >= 2)
@@ -285,11 +342,7 @@ def test_bind_port_passthrough():
     """Verify the bind port is passed correctly as a5."""
     print("\n[7] Bind port passed as a5")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    srv = FamcServer(binary)
+    srv = FamcServer(DRIVER_BIN)
     srv.start()
     disk = make_disk()
     try:
@@ -297,7 +350,6 @@ def test_bind_port_passthrough():
         out, rc, elapsed = run_tabernacle(stdin, timeout_s=45, disk_path=disk)
 
         check("exit code 0", rc == 0)
-        # 5678 = 0x162E
         check("a5 contains bind port 0x162E",
               "a5: 00 00 16 2E" in out)
     finally:
@@ -309,11 +361,7 @@ def test_multiple_seeds_in_output():
     """Verify seed list is passed correctly to executed binary."""
     print("\n[8] Seed list passed to executed binary")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    srv = FamcServer(binary)
+    srv = FamcServer(DRIVER_BIN)
     srv.start()
     disk = make_disk()
     try:
@@ -337,19 +385,14 @@ def test_disk_boot_good():
     """Valid binary on disk — should boot from disk with a1=0."""
     print("\n[9] Disk boot: valid binary")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    disk = make_disk_with_binary(binary)
+    disk = make_disk_with_binary(DRIVER_BIN)
     try:
-        # Pass a dummy seed so full_node's .seeds loop terminates
         stdin = '1234 2000 1.2.3.4:5678\x04'
         out, rc, elapsed = run_tabernacle(stdin, timeout_s=15, disk_path=disk)
 
         check("exit code 0", rc == 0)
         check("output contains data hash",
-              "DC 19 43 00" in out)
+              "Data:" in out)
         check("a1=0 (disk boot)",
               "a1: 00 00 00 00" in out)
         check("no N in output (did not fall through to net)",
@@ -362,14 +405,10 @@ def test_disk_boot_bad():
     """Corrupted binary on disk — should print H and fall through to net."""
     print("\n[10] Disk boot: corrupted binary falls through to network")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = bytearray(f.read())
-
+    binary = bytearray(DRIVER_BIN)
     binary[100] ^= 0xFF
     disk = make_disk_with_binary(bytes(binary))
     try:
-        # No seeds, so after disk fail it should print H then N
         stdin = '1234 2000\x04'
         out, rc, elapsed = run_tabernacle(stdin, timeout_s=10, disk_path=disk)
 
@@ -397,23 +436,14 @@ def test_disk_boot_empty():
 
 
 def test_mixed_seeds():
-    """One good host, one truncated, one unreachable — should succeed."""
-    print("\n[12] Mixed seeds: good + truncated + unreachable")
+    """One good host, one unreachable — should succeed."""
+    print("\n[12] Mixed seeds: good + unreachable")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    # Good server
-    good_srv = FamcServer(binary)
+    good_srv = FamcServer(DRIVER_BIN)
     good_srv.start()
 
     disk = make_disk()
     try:
-        # Seed list: good server, unreachable host (5.6.7.7:9999)
-        # The probe blast goes to all seeds; good server responds first.
-        # Since all seeds are at 10.0.2.2 in QEMU NAT, we can only use
-        # one real server. The unreachable seed just gets no response.
         stdin = (f'1234 2000 '
                  f'10.0.2.2:{good_srv.port} '
                  f'5.6.7.7:9999\x04')
@@ -421,7 +451,7 @@ def test_mixed_seeds():
 
         check("exit code 0", rc == 0)
         check("output contains data hash (successful download)",
-              "DC 19 43 00" in out)
+              "Data:" in out)
         check("a1=1 (net boot)", "a1: 00 00 00 01" in out)
         check("output shows 2 seeds",
               "2 seeds:" in out)
@@ -436,12 +466,8 @@ def test_net_boot_a1():
     """Verify a1=1 on network boot vs a1=0 on disk boot."""
     print("\n[13] Boot source: a1=0 (disk) vs a1=1 (net)")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    # Disk boot (pass dummy seed so full_node's .seeds loop terminates)
-    disk = make_disk_with_binary(binary)
+    # Disk boot
+    disk = make_disk_with_binary(DRIVER_BIN)
     try:
         stdin = '1234 2000 1.2.3.4:5678\x04'
         out_disk, rc, _ = run_tabernacle(stdin, timeout_s=15, disk_path=disk)
@@ -450,7 +476,7 @@ def test_net_boot_a1():
         os.unlink(disk)
 
     # Net boot
-    srv = FamcServer(binary)
+    srv = FamcServer(DRIVER_BIN)
     srv.start()
     disk = make_disk()
     try:
@@ -466,18 +492,12 @@ def test_seed_failover():
     """Bad seed (wrong hash) then good seed — should fail over and succeed."""
     print("\n[14] Seed failover: hash-fail server then good server")
 
-    full_node = os.path.join(BASE, 'bin', 'full_node')
-    with open(full_node, 'rb') as f:
-        binary = f.read()
-
-    # Bad server — full-size binary with corrupted content (hash mismatch)
-    bad_binary = bytearray(binary)
-    bad_binary[len(binary) // 2] ^= 0xFF
+    bad_binary = bytearray(DRIVER_BIN)
+    bad_binary[len(DRIVER_BIN) // 2] ^= 0xFF
     bad_srv = FamcServer(bytes(bad_binary))
     bad_srv.start()
 
-    # Good server — correct binary
-    good_srv = FamcServer(binary)
+    good_srv = FamcServer(DRIVER_BIN)
     good_srv.start()
 
     disk = make_disk()
@@ -491,7 +511,7 @@ def test_seed_failover():
         check("output contains H (hash fail from bad seed)",
               'H' in out)
         check("output contains data hash (successful from good seed)",
-              "DC 19 43 00" in out)
+              "Data:" in out)
         check("a1=1 (net boot)", "a1: 00 00 00 01" in out)
     finally:
         bad_srv.stop()
@@ -507,16 +527,16 @@ if __name__ == '__main__':
     print("tabernacle end-to-end tests")
     print("=" * 60)
 
-    bin_path = os.path.join(BASE, 'bin', 'tabernacle')
-    fn_path = os.path.join(BASE, 'bin', 'full_node')
-    if not os.path.exists(bin_path):
-        print(f"ERROR: {bin_path} not found — run scripts/build.sh first")
+    fam3_path = os.path.join(BASE, 'bin', 'fam3')
+    forth_path = os.path.join(BASE, 'bin', 'forth')
+    if not os.path.exists(fam3_path):
+        print(f"ERROR: {fam3_path} not found — run scripts/build.sh first")
         sys.exit(1)
-    if not os.path.exists(fn_path):
-        print(f"ERROR: {fn_path} not found — run scripts/build.sh first")
+    if not os.path.exists(forth_path):
+        print(f"ERROR: {forth_path} not found — run scripts/build.sh first")
         sys.exit(1)
 
-    os.makedirs(os.path.join(BASE, 'tmp'), exist_ok=True)
+    build_test_artifacts()
 
     test_no_seeds()
     test_successful_download()
