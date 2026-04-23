@@ -716,17 +716,15 @@ rx_ret_probe:
 	j	no_net
 
 probe_got_response:
-	# Lock onto responding seed. Identify source by matching IP.
-	# a2 = RX buffer ptr. Source IP is at offset 38..41 (IPv4 src in eth frame,
-	# after 12-byte virtio hdr + 14-byte eth + 12-byte IP offset).
-	# Actually: virtio_hdr(12) + eth_dst(6) + eth_src(6) + ethertype(2) +
-	# ip_hdr: ver(1)+tos(1)+len(2)+id(2)+frag(2)+ttl(1)+proto(1)+cksum(2)+src_ip(4)
-	# src_ip offset = 12 + 14 + 12 = 38
+	# Lock onto responding seed. Match source IP + UDP port.
+	# a2 = RX buffer ptr.
+	# virtio_hdr(12) + eth(14) + IP src offset(12) = 38
+	# virtio_hdr(12) + eth(14) + IP(20) + UDP src port = 46
 	lbu	t0, 38(a2)
 	lbu	t1, 39(a2)
 	lbu	t2, 40(a2)
 	lbu	t3, 41(a2)
-	# Find which seed matches.
+	# Find which seed matches (IP + port).
 	li	s1, 0
 	mv	s2, s7			# seed entry ptr
 find_seed:
@@ -739,6 +737,13 @@ find_seed:
 	bne	t4, t2, find_next_seed
 	lbu	t4, 3(s2)
 	bne	t4, t3, find_next_seed
+	# IP matched — now check UDP source port (BE) vs seed port (LE).
+	lbu	t4, 46(a2)		# UDP src port high byte (BE)
+	lbu	t5, 5(s2)		# seed port high byte (LE)
+	bne	t4, t5, find_next_seed
+	lbu	t4, 47(a2)		# UDP src port low byte (BE)
+	lbu	t5, 4(s2)		# seed port low byte (LE)
+	bne	t4, t5, find_next_seed
 	j	seed_locked
 find_next_seed:
 	addi	s2, s2, 6

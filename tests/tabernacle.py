@@ -462,6 +462,43 @@ def test_net_boot_a1():
         os.unlink(disk)
 
 
+def test_seed_failover():
+    """Bad seed (wrong hash) then good seed — should fail over and succeed."""
+    print("\n[14] Seed failover: hash-fail server then good server")
+
+    full_node = os.path.join(BASE, 'bin', 'full_node')
+    with open(full_node, 'rb') as f:
+        binary = f.read()
+
+    # Bad server — full-size binary with corrupted content (hash mismatch)
+    bad_binary = bytearray(binary)
+    bad_binary[len(binary) // 2] ^= 0xFF
+    bad_srv = FamcServer(bytes(bad_binary))
+    bad_srv.start()
+
+    # Good server — correct binary
+    good_srv = FamcServer(binary)
+    good_srv.start()
+
+    disk = make_disk()
+    try:
+        stdin = (f'1234 2000 '
+                 f'10.0.2.2:{bad_srv.port} '
+                 f'10.0.2.2:{good_srv.port}\x04')
+        out, rc, elapsed = run_tabernacle(stdin, timeout_s=60, disk_path=disk)
+
+        check("exit code 0", rc == 0)
+        check("output contains H (hash fail from bad seed)",
+              'H' in out)
+        check("output contains data hash (successful from good seed)",
+              "DC 19 43 00" in out)
+        check("a1=1 (net boot)", "a1: 00 00 00 01" in out)
+    finally:
+        bad_srv.stop()
+        good_srv.stop()
+        os.unlink(disk)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
@@ -493,6 +530,7 @@ if __name__ == '__main__':
     test_disk_boot_empty()
     test_mixed_seeds()
     test_net_boot_a1()
+    test_seed_failover()
 
     print("\n" + "=" * 60)
     total = passed + failed
