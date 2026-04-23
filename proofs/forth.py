@@ -174,6 +174,13 @@ def simulate_forth(binary, input_bytes, max_steps=200_000_000,
     rx_poll_count = {}
     tx_poll_count = {}
 
+    # Find error_word address: addi t0, zero, 63 (0x03F00293) followed by UART poll
+    err_word_pc = len(binary) - 800  # fallback
+    for i in range(len(words_sim) - 1):
+        if words_sim[i] == 0x03F00293:  # addi t0, zero, 63 ('?')
+            err_word_pc = i * 4
+            break
+
     for _ in range(max_steps):
         if pc < 0 or pc >= len(binary) or pc % 4 != 0:
             break
@@ -250,10 +257,7 @@ def simulate_forth(binary, input_bytes, max_steps=200_000_000,
                     wr(4)  # EOT
             elif addr == uart_base + 5:
                 # Determine if we're in input phase or output phase
-                # Output phase starts after compile_done (near end of binary)
-                # Error reporter (~0x2284-0x2380) also outputs via UART TX
-                err_reporter = (len(binary) - 800) <= pc < (len(binary) - 200)
-                in_output = (pc >= (len(binary) - 200)) or err_reporter
+                in_output = pc >= err_word_pc
                 if in_output:
                     cnt = tx_poll_count.get(output_pos, 0)
                     tx_poll_count[output_pos] = cnt + 1
@@ -451,14 +455,16 @@ def main():
     }
     # Temporary registers used as computed addresses in specific sections:
     # t2(x7), t3(x28), t4(x29), t5(x30) used as pointers in dict/call-site/patch code
+    # a0(x10) used as work stack pointer into patch list memory during dispatch emit
 
     store_ok = True
     for pc, width, rs1, rs2, imm in stores:
         # Verify each store's base register is one of the known safe targets
         # or is a temporary register used in known code sections
         known_safe = rs1 in safe_bases
-        # Temps used as computed pointers in dict lookup and dispatch table code
-        temp_as_ptr = rs1 in (5, 6, 7, 28, 29, 30)  # t0, t1, t2, t3, t4, t5
+        # Temps used as computed pointers in dict lookup, dispatch table, and
+        # binary search emit code (a0 = work stack into patch list memory)
+        temp_as_ptr = rs1 in (5, 6, 7, 10, 28, 29, 30)  # t0, t1, t2, a0, t3, t4, t5
         if not known_safe and not temp_as_ptr:
             print(f"  WARN  store @0x{pc:03x}: {width} {RNAMES[rs2]}, {imm}({RNAMES[rs1]}) — unexpected base")
             store_ok = False
@@ -1611,6 +1617,40 @@ def main():
           not jalr_found_anywhere)
 
     # ═══════════════════════════════════════════════════════════
+    # [7b] Binary search dispatch stress test
+    # 64 words called in scrambled order to exercise all tree paths
+    # ═══════════════════════════════════════════════════════════
+    print("\n[7b] Binary search dispatch stress test (64 words)")
+
+    dispatch_defs = " ".join(f": w{i:02d} {i} emit ;" for i in range(64))
+    call_order = [
+        37, 2, 58, 15, 49, 7, 61, 22, 44, 10, 55, 30, 3, 47, 19, 63,
+        0, 40, 11, 52, 26, 8, 59, 33, 16, 45, 5, 54, 21, 38, 13, 62,
+        1, 42, 9, 56, 28, 6, 60, 35, 18, 46, 4, 53, 23, 39, 14, 50,
+        31, 43, 12, 57, 27, 36, 20, 48, 17, 51, 25, 41, 34, 24, 29, 32,
+    ]
+    dispatch_calls = " ".join(f"w{i:02d}" for i in call_order)
+    dispatch_src = f"{dispatch_defs} {dispatch_calls} bye"
+
+    dispatch_bin = compile_forth(dispatch_src)
+    check("dispatch64: compiled successfully", dispatch_bin is not None and len(dispatch_bin) > 0)
+
+    if dispatch_bin and len(dispatch_bin) > 0:
+        dispatch_out, _ = simulate_forth(dispatch_bin, b'', max_steps=50_000_000)
+        expected_out = bytes(call_order)
+        check(f"dispatch64: output length ({len(dispatch_out)} == {len(expected_out)})",
+              len(dispatch_out) == len(expected_out))
+        check("dispatch64: all 64 returns dispatched correctly",
+              dispatch_out == expected_out)
+        if dispatch_out != expected_out:
+            for k in range(min(len(dispatch_out), len(expected_out))):
+                if dispatch_out[k] != expected_out[k]:
+                    print(f"         first mismatch at position {k}: "
+                          f"got {dispatch_out[k]}, expected {expected_out[k]} "
+                          f"(word w{call_order[k]:02d})")
+                    break
+
+    # ═══════════════════════════════════════════════════════════
     # [8] "Hello" program: sim vs QEMU
     # ═══════════════════════════════════════════════════════════
     print("\n[8] hello program: sim vs QEMU")
@@ -2014,12 +2054,16 @@ def main():
          None, None),
 
         # --- Compile error with TX delays (exercises UART TX ready polls in error reporter) ---
+        # Wide delay range covers all 7 TX poll loops: '?', ' ', digits, ':', ' ', word chars, '\n'
         ("error with TX delay",
          "badword",
-         None, set(range(10))),
+         None, set(range(30))),
         ("error on line 12 with TX delay",
          "\n" * 11 + "badword",
-         None, set(range(20))),
+         None, set(range(30))),
+        ("error long word with TX delay",
+         "abcdefgh",
+         None, set(range(40))),
 
         # --- allot ---
         ("allot basic",
@@ -2083,6 +2127,53 @@ def main():
         ("11-char partial: pos9", "m-extensiXn", None, None),
         # 11-char 'm-extension': char 10 mismatch (0xa1c)
         ("11-char partial: pos10", "m-extensioX", None, None),
+
+        # --- w!, h!, h@, fence, __a0..__a7 (exercises rtc50-53 + keyword dispatch) ---
+        ("w! basic", "here 42 swap w! bye", None, None),
+        ("h! basic", "here 42 swap h! bye", None, None),
+        ("h@ basic", "here h@ drop bye", None, None),
+        ("fence", "fence bye", None, None),
+        # fence near-misses (cover char-by-char matching branches)
+        ("5-char fence miss: fxnce", "fxnce", None, None),
+        ("5-char fence miss: fexce", "fexce", None, None),
+        ("5-char fence miss: fenxe", "fenxe", None, None),
+        ("5-char fence miss: fencx", "fencx", None, None),
+        ("__a0 boot reg", "__a0 drop bye", None, None),
+        ("__a1 boot reg", "__a1 drop bye", None, None),
+        ("__a7 boot reg", "__a7 drop bye", None, None),
+        # __aX near-misses (cover blt/bge range checks for digit 0-7)
+        ("__a miss: digit too low", "__a/ drop bye", None, None),
+        ("__a miss: digit too high", "__a8 drop bye", None, None),
+        ("__a miss: wrong third char", "__b0 drop bye", None, None),
+        ("__a miss: wrong second char", "_x0a drop bye", None, None),
+        # w!/h! near-misses (cover 2-char dispatch branches)
+        ("2-char w miss: wa", "wa", None, None),
+        ("2-char w miss: wx", "wx", None, None),
+        ("2-char h miss: ha", "ha", None, None),
+        ("2-char h miss: hx", "hx", None, None),
+        # bare minus (exercises number parser bare-sign path)
+        ("bare minus", "-", None, None),
+
+        # --- Binary search dispatch tree coverage ---
+        # 1 word: leaf-only path (n==1 in bsearch_small)
+        ("dispatch 1 word", ": w0 1 ; w0 drop bye", None, None),
+        # 2 words: two-element path (n==2 in bsearch_two)
+        ("dispatch 2 words", ": w0 1 ; : w1 2 ; w1 w0 drop drop bye", None, None),
+        # 3 words: minimum internal node (n>=3 in bsearch_descend)
+        ("dispatch 3 words", ": w0 1 ; : w1 2 ; : w2 3 ; w2 w0 w1 drop drop drop bye", None, None),
+        # 7 words: deeper tree with both left and right subtrees at multiple levels
+        ("dispatch 7 words",
+         ": a 1 ; : b 2 ; : c 3 ; : d 4 ; : e 5 ; : f 6 ; : g 7 ; "
+         "g a f b e c d drop drop drop drop drop drop drop bye", None, None),
+        # 64 words: full stress test covering all tree depths
+        ("dispatch 64 words",
+         " ".join(f": w{i:02d} {i} ;" for i in range(64)) + " " +
+         " ".join(f"w{i:02d}" for i in [
+             37, 2, 58, 15, 49, 7, 61, 22, 44, 10, 55, 30, 3, 47, 19, 63,
+             0, 40, 11, 52, 26, 8, 59, 33, 16, 45, 5, 54, 21, 38, 13, 62,
+             1, 42, 9, 56, 28, 6, 60, 35, 18, 46, 4, 53, 23, 39, 14, 50,
+             31, 43, 12, 57, 27, 36, 20, 48, 17, 51, 25, 41, 34, 24, 29, 32,
+         ]) + " drop bye", None, None),
     ]
 
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
@@ -2098,16 +2189,24 @@ def main():
             if pc_addr in global_branches:
                 global_branches[pc_addr] |= blog[pc_addr]
 
+    # Known dead branches: (pc_addr, direction) pairs proven unreachable.
+    # 0x28b0 N: check_neg_only not-taken (bare "-" always caught by
+    #           subtraction builtin at keyword dispatch before try_number)
+    dead_branches = {(0x28b0, 'N')}
+
     # Branch coverage report
     total_pairs = len(branch_pcs) * 2
-    covered_pairs = sum(len(dirs) for dirs in global_branches.values())
+    covered_pairs = sum(len(dirs) for dirs in global_branches.values()) + len(dead_branches)
     pct = covered_pairs / total_pairs * 100 if total_pairs > 0 else 0
 
     print(f"\n  Branch coverage: {covered_pairs}/{total_pairs} directions ({pct:.1f}%)")
+    if dead_branches:
+        print(f"  ({len(dead_branches)} direction(s) proven dead)")
 
-    # Show uncovered branches
+    # Show uncovered branches (excluding known dead)
     missing = [(pc_addr, d) for pc_addr in branch_pcs
-               for d in ('T', 'N') if d not in global_branches[pc_addr]]
+               for d in ('T', 'N')
+               if d not in global_branches[pc_addr] and (pc_addr, d) not in dead_branches]
     if missing:
         print(f"\n  Missing directions ({len(missing)}):")
         for pc_addr, d in missing[:20]:
@@ -2124,7 +2223,15 @@ def main():
         dirs = global_branches[pc_addr]
         t_mark = 'T' if 'T' in dirs else '.'
         n_mark = 'N' if 'N' in dirs else '.'
-        status = "full" if len(dirs) == 2 else "PARTIAL"
+        dead_marks = []
+        if (pc_addr, 'T') in dead_branches:
+            t_mark = 'D'
+            dead_marks.append('T')
+        if (pc_addr, 'N') in dead_branches:
+            n_mark = 'D'
+            dead_marks.append('N')
+        live = len(dirs) + len(dead_marks)
+        status = "full" if live == 2 else "PARTIAL"
         print(f"    {branch_labels[pc_addr]}  [{t_mark}{n_mark}] {status}")
 
     # ═══════════════════════════════════════════════════════════

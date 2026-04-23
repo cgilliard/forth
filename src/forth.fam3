@@ -4203,71 +4203,233 @@ patch_loop:
     addi t3, t3, 4
     j patch_loop
 
-# Emit the dispatch table entries
+# Emit the dispatch table as a binary search tree
+# Registers during emit:
+#   a0 = work stack pointer (reuses patch list memory at 0x82810000)
+#   a1 = current range lo (inclusive)
+#   a2 = current range hi (exclusive)
+#   a3 = call site list base (0x82850000)
+#   a4 = n (hi - lo)
+#   a5 = mid
+# Each stack frame: { lo (4B), mid (4B), patch_addr (4B) } = 12 bytes
+# Emitted tree layout per internal node (n >= 3):
+#   li t0, mid          — load comparison ID
+#   bne s1, t0, +8      — skip match jal if no match
+#   jal x0, call_site   — match: jump to call site
+#   bgeu s1, t0, +8     — unsigned: if s1 > mid, skip left, fall to right
+#   jal x0, left         — placeholder, patched after right subtree emitted
+#   [right subtree]
+#   [left subtree]
 emit_dispatch:
-    addi t3, zero, 0         # current ID counter
-    lui t4, 0x82850          # call site list base: 0x82850000
+    beq s10, zero, disp_done
 
-disp_loop:
-    beq t3, s10, disp_done   # emitted all entries
+    lui a0, 0x82810
+    addi a1, zero, 0
+    addi a2, s10, 0
+    lui a3, 0x82850
 
-    # Emit: li t0, t3 (addi x5, x0, t3)
-    slli t0, t3, 20
+bsearch_loop:
+    sub a4, a2, a1
+
+bsearch_descend:
+    addi t0, zero, 3
+    blt a4, t0, bsearch_small
+
+    # --- Internal node: n >= 3 ---
+    srli a5, a4, 1
+    add a5, a1, a5
+
+    # Emit: addi x5, x0, mid
+    slli t0, a5, 20
     addi t1, zero, 0x13
-    ori t1, t1, 0x280       # (5<<7) = 0x280
+    ori t1, t1, 0x280
     or t0, t0, t1
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # Emit: bne s1, t0, +8; jal x0, <call_site>
-    # This uses a trampoline because B-type (beq) is limited to ±4KB
-    # while J-type (jal) has ±1MB range.
-
-    # Load call site address
-    slli t5, t3, 2
-    add t5, t4, t5
-    lw t5, 0(t5)             # absolute address of call site
-
-    # Emit: bne x9, x5, +8 (skip over jal if ID doesn't match)
-    # B-type: imm=8, rs1=9, rs2=5, funct3=1
-    # b12=0, b11=0, b10:5=000000, rs2=5, rs1=9, funct3=1, b4:1=0100, b0=0, opcode=0x63
-    # = (0<<31)|(0<<25)|(5<<20)|(9<<15)|(1<<12)|(4<<8)|(0<<7)|0x63
-    # = 0x00549463
+    # Emit: bne x9, x5, +8
     lui t0, 0x00549
     addi t0, t0, 0x463
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # Emit: jal x0, <offset to call_site>
-    # offset = call_site_addr - current_output_pos
+    # Emit: jal x0, call_site[mid]
+    slli t5, a5, 2
+    add t5, a3, t5
+    lw t5, 0(t5)
     sub t6, t5, s3
-    # Encode J-type: jal x0, t6
     srli t0, t6, 20
     andi t0, t0, 1
-    slli t0, t0, 31          # b20
-
+    slli t0, t0, 31
     srli t1, t6, 1
     andi t1, t1, 0x3FF
-    slli t1, t1, 21          # b10:1
+    slli t1, t1, 21
     or t0, t0, t1
-
     srli t1, t6, 11
     andi t1, t1, 1
-    slli t1, t1, 20          # b11
+    slli t1, t1, 20
     or t0, t0, t1
-
     srli t1, t6, 12
     andi t1, t1, 0xFF
-    slli t1, t1, 12          # b19:12
+    slli t1, t1, 12
     or t0, t0, t1
-
     addi t1, zero, 0x6F
     or t0, t0, t1
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    addi t3, t3, 1
-    j disp_loop
+    # Emit: bgeu x9, x5, +8
+    lui t0, 0x0054F
+    addi t0, t0, 0x463
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Emit: jal x0, 0 (placeholder for left subtree jump)
+    addi t0, zero, 0x6F
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Push { lo, mid, patch_addr }
+    sw a1, 0(a0)
+    sw a5, 4(a0)
+    addi t0, s3, -4
+    sw t0, 8(a0)
+    addi a0, a0, 12
+
+    # Descend into right subtree [mid+1, hi)
+    addi a1, a5, 1
+    sub a4, a2, a1
+    j bsearch_descend
+
+bsearch_small:
+    addi t0, zero, 2
+    beq a4, t0, bsearch_two
+
+    # --- Leaf: n == 1, emit jal x0, call_site[lo] ---
+    slli t5, a1, 2
+    add t5, a3, t5
+    lw t5, 0(t5)
+    sub t6, t5, s3
+    srli t0, t6, 20
+    andi t0, t0, 1
+    slli t0, t0, 31
+    srli t1, t6, 1
+    andi t1, t1, 0x3FF
+    slli t1, t1, 21
+    or t0, t0, t1
+    srli t1, t6, 11
+    andi t1, t1, 1
+    slli t1, t1, 20
+    or t0, t0, t1
+    srli t1, t6, 12
+    andi t1, t1, 0xFF
+    slli t1, t1, 12
+    or t0, t0, t1
+    addi t1, zero, 0x6F
+    or t0, t0, t1
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j bsearch_pop
+
+bsearch_two:
+    # --- Two elements: n == 2 ---
+    # Emit: addi x5, x0, lo
+    slli t0, a1, 20
+    addi t1, zero, 0x13
+    ori t1, t1, 0x280
+    or t0, t0, t1
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Emit: bne x9, x5, +8
+    lui t0, 0x00549
+    addi t0, t0, 0x463
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Emit: jal x0, call_site[lo]
+    slli t5, a1, 2
+    add t5, a3, t5
+    lw t5, 0(t5)
+    sub t6, t5, s3
+    srli t0, t6, 20
+    andi t0, t0, 1
+    slli t0, t0, 31
+    srli t1, t6, 1
+    andi t1, t1, 0x3FF
+    slli t1, t1, 21
+    or t0, t0, t1
+    srli t1, t6, 11
+    andi t1, t1, 1
+    slli t1, t1, 20
+    or t0, t0, t1
+    srli t1, t6, 12
+    andi t1, t1, 0xFF
+    slli t1, t1, 12
+    or t0, t0, t1
+    addi t1, zero, 0x6F
+    or t0, t0, t1
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # Emit: jal x0, call_site[lo+1]
+    addi t2, a1, 1
+    slli t5, t2, 2
+    add t5, a3, t5
+    lw t5, 0(t5)
+    sub t6, t5, s3
+    srli t0, t6, 20
+    andi t0, t0, 1
+    slli t0, t0, 31
+    srli t1, t6, 1
+    andi t1, t1, 0x3FF
+    slli t1, t1, 21
+    or t0, t0, t1
+    srli t1, t6, 11
+    andi t1, t1, 1
+    slli t1, t1, 20
+    or t0, t0, t1
+    srli t1, t6, 12
+    andi t1, t1, 0xFF
+    slli t1, t1, 12
+    or t0, t0, t1
+    addi t1, zero, 0x6F
+    or t0, t0, t1
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j bsearch_pop
+
+bsearch_pop:
+    lui t0, 0x82810
+    beq a0, t0, disp_done
+
+    addi a0, a0, -12
+    lw a1, 0(a0)
+    lw a2, 4(a0)
+    lw t2, 8(a0)
+
+    # Patch placeholder jal to jump to current position
+    sub t6, s3, t2
+    srli t0, t6, 20
+    andi t0, t0, 1
+    slli t0, t0, 31
+    srli t1, t6, 1
+    andi t1, t1, 0x3FF
+    slli t1, t1, 21
+    or t0, t0, t1
+    srli t1, t6, 11
+    andi t1, t1, 1
+    slli t1, t1, 20
+    or t0, t0, t1
+    srli t1, t6, 12
+    andi t1, t1, 0xFF
+    slli t1, t1, 12
+    or t0, t0, t1
+    addi t1, zero, 0x6F
+    or t0, t0, t1
+    sw t0, 0(t2)
+
+    j bsearch_loop
 
 disp_done:
     # Emit infinite loop as fallthrough safety: j . (jal x0, 0)

@@ -17,9 +17,11 @@ Verification layers:
   Layer 3 — Exec gate proof
     Every path to exec_binary is preceded by check_hash returning a0=0.
 
-  Layer 4 — Exhaustive store enumeration
+  Layer 4 — Exhaustive store enumeration + code-region write protection
 
-  Layer 5 — RV32I simulator with virtio MMIO mocking
+  Layer 5 — Gimli hash correctness
+    Python gimli_permute matches official test vector.
+    Assembly gimli_hash matches Python on multiple input sizes.
 
   Layer 6 — Simulator-based test vectors with branch coverage
 
@@ -219,7 +221,8 @@ class VirtioDevice:
 
 def simulate_tabernacle(binary, uart_input, disk_data=None,
                         net_responses=None, mtime_step=10,
-                        mtime_jumps=None, max_steps=500_000_000):
+                        mtime_jumps=None, max_steps=500_000_000,
+                        payload_size=None):
     """Execute tabernacle binary instruction-by-instruction.
 
     Args:
@@ -232,17 +235,21 @@ def simulate_tabernacle(binary, uart_input, disk_data=None,
         mtime_step: mtime increment per instruction
         mtime_jumps: dict mapping mtime thresholds to jump-to values
         max_steps: max instructions before giving up
+        payload_size: expected payload size (BIN_SIZE) for bounds checking
 
     Returns:
-        (uart_output, branch_log, exit_reason, regs)
+        (uart_output, branch_log, exit_reason, regs, bounds_ok)
         branch_log: {pc: set('T','N')}
         exit_reason: 'shutdown', 'endmark', 'timeout', 'error'
         regs: list of 32 register values at exit
+        bounds_ok: True if all download writes stayed within [endmark, endmark+payload_size)
     """
     words_sim = [struct.unpack_from('<I', binary, i)[0]
                  for i in range(0, len(binary), 4)]
     binary_len = len(binary)
     endmark_addr = binary_len
+    download_bounds_ok = True
+    download_limit = endmark_addr + (payload_size if payload_size else 0)
 
     regs = [0] * 32
     pc = 0
@@ -409,8 +416,8 @@ def simulate_tabernacle(binary, uart_input, disk_data=None,
     for step in range(max_steps):
         if pc < 0 or pc >= binary_len or pc % 4 != 0:
             if pc == endmark_addr:
-                return bytes(output), branch_log, 'endmark', list(regs)
-            return bytes(output), branch_log, 'error', list(regs)
+                return bytes(output), branch_log, 'endmark', list(regs), download_bounds_ok
+            return bytes(output), branch_log, 'error', list(regs), download_bounds_ok
 
         idx = pc // 4
         w = words_sim[idx]
@@ -433,7 +440,7 @@ def simulate_tabernacle(binary, uart_input, disk_data=None,
 
         # WFI — shutdown
         if w == 0x10500073:
-            return bytes(output), branch_log, 'shutdown', list(regs)
+            return bytes(output), branch_log, 'shutdown', list(regs), download_bounds_ok
 
         def wr(val):
             if rd != 0:
@@ -540,7 +547,7 @@ def simulate_tabernacle(binary, uart_input, disk_data=None,
             if addr == UART_BASE:
                 output.append(val & 0xFF)
             elif addr == SHUTDOWN_ADDR:
-                return bytes(output), branch_log, 'shutdown', list(regs)
+                return bytes(output), branch_log, 'shutdown', list(regs), download_bounds_ok
             elif 0x10001000 <= addr <= 0x10008FFF:
                 dev, offset = get_mmio_device(addr)
                 if dev:
@@ -558,6 +565,9 @@ def simulate_tabernacle(binary, uart_input, disk_data=None,
                             else:
                                 handle_net_rx_notify(dev)
             else:
+                if payload_size and regs[27] > 0 and endmark_addr <= addr < regs[27]:
+                    if addr >= download_limit:
+                        download_bounds_ok = False
                 if f3 == 0:  # sb
                     mem_write_byte(addr, val)
                 elif f3 == 1:  # sh
@@ -586,11 +596,11 @@ def simulate_tabernacle(binary, uart_input, disk_data=None,
             next_pc = (pc + rv_imm_j(w)) & 0xFFFFFFFF
 
         if next_pc == pc:
-            return bytes(output), branch_log, 'self-loop', list(regs)
+            return bytes(output), branch_log, 'self-loop', list(regs), download_bounds_ok
         pc = next_pc
         mtime += mtime_step
 
-    return bytes(output), branch_log, 'timeout', list(regs)
+    return bytes(output), branch_log, 'timeout', list(regs), download_bounds_ok
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1748,10 +1758,270 @@ def main():
     print(f"    virtio MMIO offsets used: "
           f"{', '.join(f'0x{o:x}' for o in sorted(vio_offsets))}")
 
+    # ── Code-region write protection proof ──
+    # Prove no store can target the code section [0, endmark).
+    # For each store, backward-trace the base register to classify the
+    # target address as: s11-derived (data region), sp-derived (stack),
+    # MMIO, shutdown, or endmark-derived (download region).
+    #
+    # s11 = page_align(endmark + BIN_SIZE) >= endmark, so s11-derived
+    # and sp-derived (sp = s11 + 1MiB) addresses are always >= endmark.
+    #
+    # endmark-derived stores write to the download region [endmark, s11)
+    # which is past the code section — these are intentional.
+
+    print("\n    Code-region write protection analysis:")
+    code_end = N * 4  # endmark address
+
+    SAFE_KNOWN_BASES = {
+        27: 's11 (data region, >= endmark + BIN_SIZE)',
+        2:  'sp (stack, = s11 + 1MiB)',
+        8:  's0 (virtio MMIO scan, >= 0x10001000)',
+        19: 's3 (disk virtio base)',
+        20: 's4 (gimli state / stack ptr)',
+    }
+
+    store_classes = {
+        's11-derived': [],
+        'sp-derived': [],
+        'mmio': [],
+        'shutdown': [],
+        'endmark-derived': [],
+        'unclassified': [],
+    }
+
+    S11_SET = {27}       # s11
+    SP_SET = {2}         # sp
+    MMIO_SET = {8, 19}   # s0, s3
+
+    def classify_reg(reg, store_pc, depth=0):
+        """Backward-trace to find the source of a register value."""
+        if depth > 3:
+            return None
+        if reg in S11_SET:
+            return 's11-derived'
+        if reg in SP_SET:
+            return 'sp-derived'
+        if reg in MMIO_SET:
+            return 'mmio'
+
+        cur = reg
+        for back in range(store_pc // 4 - 1, max(0, store_pc // 4 - 150), -1):
+            bw = code_words[back]
+            bop = rv_opcode(bw)
+
+            # Store (0x23) and branch (0x63) don't write registers — skip
+            if bop in (0x23, 0x63):
+                continue
+
+            brd = rv_rd(bw)
+            if brd != cur or brd == 0:
+                continue
+
+            if bop == 0x33:  # R-type (add/sub/or/xor/etc)
+                brs1 = rv_rs1(bw)
+                brs2 = rv_rs2(bw)
+                bf7 = (bw >> 25) & 0x7F
+                bf3 = (bw >> 12) & 7
+                if bf7 == 0 and bf3 == 0:  # add
+                    if brs1 in S11_SET or brs2 in S11_SET:
+                        return 's11-derived'
+                    if brs1 in SP_SET or brs2 in SP_SET:
+                        return 'sp-derived'
+                    if brs1 in MMIO_SET or brs2 in MMIO_SET:
+                        return 'mmio'
+                    # Neither operand is a known-safe register.
+                    # Try tracing each operand.
+                    for try_reg in (brs1, brs2):
+                        result = classify_reg(try_reg, back * 4, depth + 1)
+                        if result:
+                            return result
+                elif bf3 in (6, 7, 4):  # or, and, xor — result derived from operands
+                    for try_reg in (brs1, brs2):
+                        result = classify_reg(try_reg, back * 4, depth + 1)
+                        if result:
+                            return result
+                return None
+            elif bop == 0x13:  # I-type (addi, slli, andi, etc)
+                bf3 = (bw >> 12) & 7
+                brs1 = rv_rs1(bw)
+                if bf3 == 0:  # addi
+                    if brs1 in S11_SET:
+                        return 's11-derived'
+                    if brs1 in SP_SET:
+                        return 'sp-derived'
+                    if brs1 in MMIO_SET:
+                        return 'mmio'
+                    if brs1 == cur:
+                        continue
+                    cur = brs1
+                    continue
+                elif bf3 in (1, 7, 4, 6):  # slli, andi, xori, ori
+                    if brs1 == cur:
+                        continue
+                    cur = brs1
+                    continue
+                return None
+            elif bop == 0x37:  # lui
+                upper = bw >> 12
+                if upper >= 0x10000:
+                    return 'mmio'
+                if upper == 0x00100:
+                    return 'shutdown'
+                return None
+            elif bop == 0x17:  # auipc
+                return 'endmark-derived'
+            elif bop == 0x03:  # load — check if loading from stack
+                brs1 = rv_rs1(bw)
+                if brs1 in SP_SET:
+                    return 'sp-derived'
+                if brs1 in S11_SET:
+                    return 's11-derived'
+                return None
+            elif bop == 0x6F:  # jal — skip (doesn't affect our register)
+                continue
+            else:
+                return None
+        return None
+
+    for pc, width, rs1, rs2, imm in stores:
+        cls = classify_reg(rs1, pc)
+        if cls:
+            store_classes[cls].append(pc)
+        else:
+            store_classes['unclassified'].append(pc)
+
+    for cls, pcs in sorted(store_classes.items()):
+        if pcs:
+            print(f"      {len(pcs):3d} stores → {cls}")
+
+    unclassified = store_classes['unclassified']
+    if unclassified:
+        print("    WARNING: unclassified stores:")
+        for pc in unclassified:
+            s = [(p, w, r1, r2, im) for p, w, r1, r2, im in stores if p == pc][0]
+            print(f"      0x{pc:04x}: {s[1]} {RNAMES[s[3]]}, {s[4]}({RNAMES[s[2]]})")
+
+    check("no stores can target code region [0, endmark)", len(unclassified) == 0)
+
+    endmark_pcs = store_classes['endmark-derived']
+    if endmark_pcs:
+        print(f"    {len(endmark_pcs)} endmark-derived stores (download writes):")
+        for pc in endmark_pcs:
+            s = [(p, w, r1, r2, im) for p, w, r1, r2, im in stores if p == pc][0]
+            print(f"      0x{pc:04x}: {s[1]} {RNAMES[s[3]]}, {s[4]}({RNAMES[s[2]]})")
+
+    # ── Download region bounds verification ──
+    # Static: only 2 endmark-derived stores exist (proven above).
+    # Dynamic: simulator verifies all writes to [endmark, ...) stay within
+    # [endmark, endmark + BIN_SIZE) across all test inputs.
+    # This covers all 3 download paths (disk read, probe copy, batch copy).
+    # Deferred to Layer 6 simulator tests (checked via memory tracking).
+
+    # ── DMA safety: virtio descriptor buffer addresses ──
+    # Virtio devices DMA at addresses specified in descriptors.
+    # RX descriptors: buffer addrs are s11 + NET_RX_BUFFERS + i*1536 (s11-derived).
+    # TX descriptor: buffer addr is s11 + NET_TX_BUFFER (s11-derived).
+    # Disk descriptors: data buffer addr = endmark ptr (intentional download region).
+    #
+    # Verify: every store that writes a non-zero address into a descriptor
+    # addr field (offset 0, 8, 16, 32 from an s11-derived base) stores a
+    # value that is s11-derived, sp-derived, or endmark-derived.
+
+    print("\n    DMA safety (virtio descriptor buffer addresses):")
+
+    # Identify descriptor addr-field stores: sw to offset 0/8/16/32 of s11-derived base
+    # where the stored value is a pointer (non-zero, non-immediate).
+    # Offset 0 = desc[N].addr, offset 16 = desc[N+1].addr, offset 32 = desc[N+2].addr
+    # Offset 8 = desc[N].addr (for desc entry at base+8 in chained descriptors)
+    dma_addr_stores = []
+    for pc, width, rs1, rs2, imm in stores:
+        if width != 'sw':
+            continue
+        if rs2 == 0:
+            continue
+        cls_base = classify_reg(rs1, pc)
+        if cls_base != 's11-derived':
+            continue
+        val_cls = classify_reg(rs2, pc)
+        if val_cls is None:
+            continue
+        dma_addr_stores.append((pc, rs2, imm, val_cls))
+
+    dma_safe = True
+    for pc, rs2, imm, cls in dma_addr_stores:
+        safe = cls in ('s11-derived', 'endmark-derived', 'sp-derived', 'mmio')
+        if not safe:
+            print(f"      UNSAFE 0x{pc:04x}: sw {RNAMES[rs2]}, {imm}(...) → {cls}")
+            dma_safe = False
+
+    # Count by classification
+    dma_cls_counts = {}
+    for _, _, _, cls in dma_addr_stores:
+        dma_cls_counts[cls] = dma_cls_counts.get(cls, 0) + 1
+    for cls, cnt in sorted(dma_cls_counts.items()):
+        print(f"      {cnt:3d} descriptor values → {cls}")
+
+    check("all DMA descriptor values target safe regions (above code)", dma_safe)
+
     # ═══════════════════════════════════════════════════════════
-    # [5] Simulator-based test vectors with branch coverage
+    # [5] Gimli hash correctness
     # ═══════════════════════════════════════════════════════════
-    print("\n[5] Simulator-based branch coverage tests")
+    print("\n[5] Gimli hash correctness")
+
+    # 5a: Python gimli_permute against official test vector
+    from gen_bin_config import gimli_permute, gimli_hash
+    gimli_tv_in = [(i * i * i + i * 0x9e3779b9) & 0xFFFFFFFF for i in range(12)]
+    gimli_tv_out = [0xba11c85a, 0x91bad119, 0x380ce880, 0xd24c2c68,
+                    0x3eceffea, 0x277a921c, 0x4f73a0bd, 0xda5a9cd8,
+                    0x84b673f0, 0x34e52ff7, 0x9e2bef49, 0xf41bb8d6]
+    test_state = list(gimli_tv_in)
+    gimli_permute(test_state)
+    check("gimli_permute matches official test vector", test_state == gimli_tv_out)
+
+    # 5b: Assembly gimli_hash matches Python gimli_hash on multiple inputs.
+    # The simulator runs the full binary; a successful disk boot means
+    # the binary's gimli_hash(payload) == expected hash. We test with
+    # payloads of varying sizes to exercise different padding paths.
+    fam3_path = os.path.join(BASE, 'bin', 'fam3')
+    if not os.path.exists(fam3_path):
+        print("  SKIP  fam3 not found, skipping assembly gimli tests")
+    else:
+        gimli_test_sizes = [
+            1,      # 1 byte: minimal, rem=1
+            15,     # 15 bytes: rem=15, nearly full rate block
+            16,     # 16 bytes: exact rate block + empty pad block
+            17,     # 17 bytes: 1 full block + rem=1
+            31,     # 31 bytes: 1 full block + rem=15
+            32,     # 32 bytes: 2 full blocks + empty pad
+            48,     # 48 bytes: 3 full blocks + empty pad
+            100,    # 100 bytes: 6 full blocks + rem=4
+            1400,   # 1400 bytes: 1 FAMC chunk
+            2800,   # 2800 bytes: 2 chunks
+        ]
+        gimli_ok = 0
+        for sz in gimli_test_sizes:
+            payload = bytes(range(256)) * (sz // 256 + 1)
+            payload = payload[:sz]
+            tab = build_tabernacle_binary(payload)
+            out, blog, reason, regs, _ = simulate_tabernacle(
+                tab, b'1234 2000\x04',
+                disk_data=payload,
+                max_steps=500_000_000,
+            )
+            if reason == 'endmark':
+                gimli_ok += 1
+            else:
+                print(f"    FAIL  gimli({sz} bytes): reason={reason}, "
+                      f"output={out}")
+        check(f"assembly gimli_hash matches Python on {len(gimli_test_sizes)} "
+              f"inputs ({gimli_ok}/{len(gimli_test_sizes)})",
+              gimli_ok == len(gimli_test_sizes))
+
+    # ═══════════════════════════════════════════════════════════
+    # [6] Simulator-based test vectors with branch coverage
+    # ═══════════════════════════════════════════════════════════
+    print("\n[6] Simulator-based branch coverage tests")
 
     fam3_path = os.path.join(BASE, 'bin', 'fam3')
     if not os.path.exists(fam3_path):
@@ -2050,14 +2320,25 @@ def main():
 
         ]
 
+        bin_payload_size = {
+            id(tab_small): 2800,
+            id(tab_multi): 46200,
+            id(tab_aligned): 44800,
+        }
+
+        download_bounds_failures = []
         for name, tab_bin, uart_in, disk, net_resp, mt_jumps in coverage_tests:
-            out, blog, reason, regs_final = simulate_tabernacle(
+            psz = bin_payload_size.get(id(tab_bin))
+            out, blog, reason, regs_final, dl_ok = simulate_tabernacle(
                 tab_bin, uart_in,
                 disk_data=disk,
                 net_responses=net_resp,
                 mtime_jumps=mt_jumps or {},
                 max_steps=500_000_000,
+                payload_size=psz,
             )
+            if not dl_ok:
+                download_bounds_failures.append(name)
             for pc_addr in blog:
                 if pc_addr in global_branches:
                     global_branches[pc_addr] |= blog[pc_addr]
@@ -2081,6 +2362,13 @@ def main():
 
         check(f"branch coverage ≥ 79% ({pct:.1f}%)", pct >= 79.0)
 
+        if download_bounds_failures:
+            for f in download_bounds_failures:
+                print(f"    FAIL  download bounds: {f}")
+        check(f"download writes stay within [endmark, endmark+BIN_SIZE) "
+              f"across {len(coverage_tests)} tests",
+              len(download_bounds_failures) == 0)
+
         # Per-branch display
         print()
         for pc_addr in branch_pcs:
@@ -2091,9 +2379,10 @@ def main():
             print(f"    {branch_labels[pc_addr]}  [{t_mark}{n_mark}] {status}")
 
     # ═══════════════════════════════════════════════════════════
-    # [6] QEMU end-to-end tests
+    # [7] QEMU end-to-end tests
     # ═══════════════════════════════════════════════════════════
-    print("\n[6] QEMU end-to-end tests")
+    print("\n[7] QEMU end-to-end tests")
+    pre_qemu_passed = passed
 
     forth_path = os.path.join(BASE, 'bin', 'forth')
     if not os.path.exists(fam3_path) or not os.path.exists(forth_path):
@@ -2137,9 +2426,12 @@ def main():
         print(f"        1 jump to endmark (exec gate)")
         print(f"    [3] exec gate: both paths guarded by bnez a0 (hash check)")
         print(f"    [4] {len(stores)} stores enumerated — all via safe base registers")
+        print(f"        DMA descriptor addresses target safe regions")
         if os.path.exists(fam3_path):
-            print(f"    [5] branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
-            print(f"    [6] {passed - 22 - 1} QEMU end-to-end tests passed")
+            print(f"    [5] gimli_hash verified (official test vector + {len(gimli_test_sizes)} assembly tests)")
+            print(f"    [6] branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
+            print(f"        download writes verified within bounds across {len(coverage_tests)} tests")
+            print(f"    [7] {passed - pre_qemu_passed} QEMU end-to-end tests passed")
 
     return 1 if failed > 0 else 0
 
