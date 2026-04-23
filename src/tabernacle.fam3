@@ -52,6 +52,7 @@
 .equ	RX_PROC_IDX,		40944
 .equ	NET_FAIL_CNT,		40946
 .equ	NET_FAIL_MASK,		40948
+.equ	BIND_PORT_SAVE,		40952
 
 # ── Networking ─────────────────────────────────────────────────────────
 .equ	VIO_DEVICE_FEATURES,	0x010
@@ -123,7 +124,7 @@ zero_loop:
 
 	# -- Parse bind port + seed list from UART --------------------
 	# Format: "bind_port ip:port ip:port ...\004"
-	# Bind port saved in s4. Seeds stored at s11+SEED_LIST_OFFSET:
+	# Bind port saved in s4 (later moved to BIND_PORT_SAVE). Seeds stored at s11+SEED_LIST_OFFSET:
 	# [u8 count][6-byte entries × N]
 	li	t5, UART_BASE
 	li	s4, 0			# bind port accumulator
@@ -339,7 +340,9 @@ exec_binary:
 	lla	a3, endmark
 	li	t0, MTIME_ADDR
 	lw	a4, 0(t0)
-	mv	a5, s4
+	li	t0, BIND_PORT_SAVE
+	add	t0, s11, t0
+	lw	a5, 0(t0)
 	j	endmark
 
 emit_warn:
@@ -767,6 +770,14 @@ num_chunks_done:
 	sw	zero, 8(t0)
 	sw	zero, 12(t0)
 
+	# Save bind port (s4) before repurposing for batch timeout.
+	li	t0, BIND_PORT_SAVE
+	add	t0, s11, t0
+	sw	s4, 0(t0)
+	# s4 = batch start timestamp (for 10s seed timeout).
+	li	t0, MTIME_ADDR
+	lw	s4, 0(t0)
+
 batch_loop:
 	# Check if we're past the last chunk.
 	bge	s3, s10, download_complete
@@ -786,6 +797,8 @@ batch_end_ok:
 	j	batch_check_complete
 
 batch_send:
+	li	t0, MTIME_ADDR
+	lw	s4, 0(t0)
 	li	t0, NET_BATCH_BITMAP
 	add	t0, s11, t0
 	sw	zero, 0(t0)
@@ -944,16 +957,16 @@ repost_ret_ignore:
 
 batch_no_famc:
 	# Not a FAMC packet (maybe ARP was handled, or no packet).
-	# Check retry timer.
 	li	t0, MTIME_ADDR
 	lw	t0, 0(t0)
-	sub	t1, t0, s5
 
-	# Check seed timeout (10 seconds).
+	# Check seed timeout (10 seconds from batch start, using s4).
+	sub	t1, t0, s4
 	li	t2, 0x05F5E100		# NET_TIMEOUT_MS * MTIME_FREQ_KHZ
 	bge	t1, t2, seed_timeout
 
-	# Check retry interval (100ms = 1,000,000 ticks).
+	# Check retry interval (100ms from last activity, using s5).
+	sub	t1, t0, s5
 	li	t2, 1000000
 	blt	t1, t2, batch_recv	# not yet — keep polling
 	# Retry: find first missing chunk and request from there.
