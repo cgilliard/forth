@@ -12,19 +12,7 @@
 \ image to disk sector 0 so subsequent boots find it there. Stage 2 will add
 \ the UDP chunk-server on port __a5.
 
-\ ─── Print helpers ───────────────────────────────────────────────────────
-
-: .dec ( n -- ) dup 10 < if 48 + emit else
-  dup 10 / .dec 10 mod 48 + emit then ;
-
-: .str ( addr len -- ) 0 do dup i + c@ emit loop drop ;
-
-\ ─── Panic (bye can't be used inside colon defs; use raw MMIO write) ─────
-\
-\ Writes the SiFive test-finisher "pass" code to its MMIO register, which
-\ triggers a clean QEMU shutdown even inside a word body.
-
-: halt  21845 1048576 w! ;   \ 0x5555 → 0x00100000
+\ Utility words (.dec .str etc.) are provided by utils.forth.
 
 \ ─── Virtio MMIO constants (legacy interface) ────────────────────────────
 
@@ -192,16 +180,16 @@ reserve-layout
 s" full_node: boot src=" .str  __a1 .dec
 s"   size=" .str               __a2 .dec
 s"   port=" .str               __a5 .dec
-10 emit
+cr
 
 __a1 1 = if
-  s" full_node: writing image to disk" .str 10 emit
+  s" full_node: writing image to disk" .str cr
   disk-init 0 = if
-    s" full_node: no virtio-blk device" .str 10 emit
-    halt
+    s" full_node: no virtio-blk device" .str cr
+    bye
   then
   write-image
-  s" full_node: disk write complete" .str 10 emit
+  s" full_node: disk write complete" .str cr
 then
 
 bye

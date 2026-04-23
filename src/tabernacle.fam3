@@ -296,6 +296,13 @@ parse_done:
 	add	t0, s11, t0
 	sb	s5, 0(t0)
 
+	# Save bind port (s4) so it is available on both disk and net boots.
+	# The net path re-saves this later; doing it here ensures disk boots
+	# also pass the parsed port through to full_node in a5.
+	li	t0, BIND_PORT_SAVE
+	add	t0, s11, t0
+	sw	s4, 0(t0)
+
 	# Scan QEMU-virt virtio MMIO slots for device_id=2 (blk).
 	li	s0, VIO_SCAN_START
 scan_disk:

@@ -561,6 +561,24 @@ not_hstore2:
     addi t1, zero, 64          # '@'
     beq t3, t1, emit_hfetch
 not_hfetch2:
+    # ">r" = '>','r'
+    addi t1, zero, 62          # '>'
+    bne t0, t1, not_rto2
+    addi t1, zero, 114         # 'r'
+    beq t3, t1, emit_rto
+not_rto2:
+    # "r>" = 'r','>'
+    addi t1, zero, 114         # 'r'
+    bne t0, t1, not_rfrom2
+    addi t1, zero, 62          # '>'
+    beq t3, t1, emit_rfrom
+not_rfrom2:
+    # "r@" = 'r','@'
+    addi t1, zero, 114         # 'r'
+    bne t0, t1, not_rat2
+    addi t1, zero, 64          # '@'
+    beq t3, t1, emit_rat
+not_rat2:
     j not_len2
 not_len2:
 
@@ -748,6 +766,16 @@ not_loop4:
     addi t5, t5, -48           # digit = t5 - '0'
     j emit_boot_reg
 not_boot4:
+    # "pick" = 'p','i','c','k'
+    addi t1, zero, 112         # 'p'
+    bne t0, t1, not_pick4
+    addi t1, zero, 105         # 'i'
+    bne t3, t1, not_pick4
+    addi t1, zero, 99          # 'c'
+    bne t4, t1, not_pick4
+    addi t1, zero, 107         # 'k'
+    beq t5, t1, emit_pick
+not_pick4:
     j not_len4
 not_len4:
 
@@ -1727,6 +1755,128 @@ push_boot_cont:
     addi s3, s3, 4
     j compile_loop
 
+# --- >r (push data TOS onto the return/shadow stack) ---
+# sw   s3, 0(s2)       store TOS on shadow stack
+# addi s2, s2, 4       advance shadow pointer
+# lw   s3, 0(s4)       pop new data TOS
+# addi s4, s4, 4
+emit_rto:
+    addi a0, zero, 54
+    j emit_shadow_check
+shadow_rto_cont:
+    # sw x19, 0(x18): 0x01392023
+    lui t0, 0x01392
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x18, x18, 4: 0x00490913
+    lui t0, 0x00491
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    addi a0, zero, 55
+    j emit_underflow_check
+pop_rto_cont:
+    # lw x19, 0(x20): 0x000A2983
+    lui t0, 0x000A3
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # addi x20, x20, 4: 0x004A0A13
+    lui t0, 0x004A1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- r> (pop the return/shadow stack onto data TOS) ---
+# addi s4, s4, -4      make room on data stack
+# sw   s3, 0(s4)       push old TOS
+# addi s2, s2, -4      retract shadow pointer
+# lw   s3, 0(s2)       load new TOS
+emit_rfrom:
+    addi a0, zero, 56
+    j emit_stk_check
+push_rfrom_cont:
+    # addi x20, x20, -4: 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw x19, 0(x20): 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    addi a0, zero, 57
+    j emit_shadow_underflow_check
+shadow_rfrom_cont:
+    # addi x18, x18, -4: 0xFFC90913
+    lui t0, 0xFFC91
+    addi t0, t0, -0x6ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # lw x19, 0(x18): 0x00092983
+    lui t0, 0x00093
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- r@ (peek shadow stack top, leave shadow unchanged) ---
+# addi s4, s4, -4      make room on data stack
+# sw   s3, 0(s4)       push old TOS
+# lw   s3, -4(s2)      read shadow top without popping
+emit_rat:
+    addi a0, zero, 58
+    j emit_stk_check
+push_rat_cont:
+    # addi x20, x20, -4: 0xFFCA0A13
+    lui t0, 0xFFCA1
+    addi t0, t0, -0x5ED
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # sw x19, 0(x20): 0x013A2023
+    lui t0, 0x013A2
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    addi a0, zero, 59
+    j emit_shadow_underflow_check
+shadow_rat_cont:
+    # lw x19, -4(x18): 0xFFC92983
+    lui t0, 0xFFC93
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
+# --- pick ( xu ... x0 u -- xu ... x0 xu ) ---
+# slli t0, s3, 2       t0 = u * 4
+# add  t0, s4, t0      t0 = &x_u  (s4 points at x_0; x_u lives at s4+u*4)
+# lw   s3, 0(t0)       TOS = x_u
+emit_pick:
+    addi a0, zero, 60
+    j emit_underflow_check
+pop_pick_cont:
+    # slli x5, x19, 2: funct7=0, shamt=2, rs1=19, funct3=1, rd=5, op=0x13
+    # = (0<<25)|(2<<20)|(19<<15)|(1<<12)|(5<<7)|0x13 = 0x00299293
+    lui t0, 0x00299
+    addi t0, t0, 0x293
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # add x5, x20, x5: (0<<25)|(5<<20)|(20<<15)|(0<<12)|(5<<7)|0x33 = 0x005A02B3
+    lui t0, 0x005A0
+    addi t0, t0, 0x2B3
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # lw x19, 0(x5): 0x0002A983
+    lui t0, 0x0002B
+    addi t0, t0, -0x67D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    j compile_loop
+
 # --- here (push heap pointer address) ---
 # addi s4, s4, -4     push TOS
 # sw   s3, 0(s4)
@@ -2237,16 +2387,9 @@ emit_rot:
 #   addi t0, t0, 0x555    FINISHER_PASS lower
 #   sw   t0, 0(s5)        trigger poweroff
 emit_bye:
-    # Check no unclosed colon definition
-    beqz tp, bye_def_ok
-    j error_unclosed_def
-bye_def_ok:
-    # Check control stack balanced
-    lui t0, 0x82800
-    addi t0, t0, 0x100
-    beq s9, t0, bye_ctrl_ok
-    j error_unmatched_ctrl
-bye_ctrl_ok:
+    # bye is allowed anywhere (including inside colon definitions).
+    # Any unclosed definition or unbalanced control structure will still
+    # be caught by the end-of-input finalization path.
     # lui x21, 0x100 = (0x100 << 12) | (21 << 7) | 0x37 = 0x00100AB7
     lui t0, 0x00101        # bit11 of AB7=1, +1
     addi t0, t0, -0x549
@@ -3815,6 +3958,20 @@ emit_rt_check:
     beqz a0, rtc52
     addi a0, a0, -1
     beqz a0, rtc53
+    addi a0, a0, -1
+    beqz a0, rtc54
+    addi a0, a0, -1
+    beqz a0, rtc55
+    addi a0, a0, -1
+    beqz a0, rtc56
+    addi a0, a0, -1
+    beqz a0, rtc57
+    addi a0, a0, -1
+    beqz a0, rtc58
+    addi a0, a0, -1
+    beqz a0, rtc59
+    addi a0, a0, -1
+    beqz a0, rtc60
     j error_word
 rtc0:
     j push_dup_cont
@@ -3924,6 +4081,20 @@ rtc52:
     j pop_hstore2_cont
 rtc53:
     j push_boot_cont
+rtc54:
+    j shadow_rto_cont
+rtc55:
+    j pop_rto_cont
+rtc56:
+    j push_rfrom_cont
+rtc57:
+    j shadow_rfrom_cont
+rtc58:
+    j push_rat_cont
+rtc59:
+    j shadow_rat_cont
+rtc60:
+    j pop_pick_cont
 
 # ============================================================================
 # Error handlers: write error name to word buffer, then fall through/jump to error_word

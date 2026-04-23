@@ -31,7 +31,7 @@ run bin/fam2 src/fam3.fam2 > bin/fam3
 run bin/fam3 src/forth.fam3 > bin/forth
 run bin/fam3 src/build_full_node.fam3 > bin/build_full_node
 run bin/fam3 src/gen_bin_config.fam3 > bin/gen_bin_config
-run bin/forth src/full_node.forth > bin/full_node
+run bin/forth src/utils.forth src/full_node.forth > bin/full_node
 
 # Prepare work disk: fn ++ bible concatenated, sector-padded.
 # build_full_node reads sizes from stdin, reads fn+bible from disk sector 0,
