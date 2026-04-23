@@ -5,6 +5,9 @@ Usage: server.py [binary_path] [port]
   Default binary: tmp/node.bin
   Default port:   3737
 
+The file is re-read from disk whenever its mtime changes, so you can
+overwrite it in place without restarting the server.
+
 Protocol:
   REQ_RANGE: "FAMC" + 0x02 + start(BE u16) + end(BE u16)
   RSP_CHUNK: "FAMC" + 0x82 + seq(BE u16) + data (up to 1400 bytes)
@@ -24,11 +27,25 @@ if len(sys.argv) > 1:
 if len(sys.argv) > 2:
     PORT = int(sys.argv[2])
 
-with open(BINARY, 'rb') as f:
-    data = f.read()
+state = {'mtime': None, 'chunks': []}
 
-chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
-print(f"Loaded {BINARY}: {len(data)} bytes, {len(chunks)} chunk(s)")
+
+def reload_if_changed():
+    try:
+        mtime = os.path.getmtime(BINARY)
+    except OSError as e:
+        print(f"Warning: cannot stat {BINARY}: {e}")
+        return
+    if mtime == state['mtime']:
+        return
+    with open(BINARY, 'rb') as f:
+        data = f.read()
+    state['mtime'] = mtime
+    state['chunks'] = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
+    print(f"Loaded {BINARY}: {len(data)} bytes, {len(state['chunks'])} chunk(s)")
+
+
+reload_if_changed()
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -41,6 +58,8 @@ while True:
         continue
     cmd = pkt[4]
     if cmd == 0x02:  # REQ_RANGE
+        reload_if_changed()
+        chunks = state['chunks']
         start, end = struct.unpack('>HH', pkt[5:9])
         print(f"REQ_RANGE {start}..{end} from {addr}")
         for seq in range(start, min(end + 1, len(chunks))):
