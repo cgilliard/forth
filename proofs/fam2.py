@@ -487,6 +487,39 @@ def main():
                 template_ok = False
     check("all templates have correct opcode for their format", template_ok)
 
+    # Completeness: every expected mnemonic must be present in the binary
+    mnem_names_set = {name for name, _, _, _, _ in mnem_entries}
+    missing_mnem = [m for m in EXPECTED_MNEMONICS if m not in mnem_names_set]
+    check("all expected RV32I mnemonics present in table",
+          len(missing_mnem) == 0)
+    for m in missing_mnem:
+        print(f"         missing expected mnemonic: {m}")
+
+    # Per-format counts (catches regressions where a mnemonic changes format)
+    fmt_counts = {f: 0 for f in range(8)}
+    for _, _, fmt, _, _ in mnem_entries:
+        if fmt < 8:
+            fmt_counts[fmt] += 1
+    check("exactly 10 R-type mnemonics (fmt=0)", fmt_counts[0] == 10)
+    check("exactly 9 I-type arithmetic mnemonics (fmt=1)", fmt_counts[1] == 9)
+    check("exactly 3 S-type (store) mnemonics (fmt=2)", fmt_counts[2] == 3)
+    check("exactly 6 B-type (branch) mnemonics (fmt=3)", fmt_counts[3] == 6)
+    check("exactly 2 U-type mnemonics (fmt=4)", fmt_counts[4] == 2)
+    check("exactly 1 J-type (jal) mnemonic (fmt=5)", fmt_counts[5] == 1)
+    check("exactly 6 pseudo-instructions (fmt=6)", fmt_counts[6] == 6)
+    check("exactly 5 load mnemonics (fmt=7)", fmt_counts[7] == 5)
+
+    # Pseudo-ID uniqueness (every pseudo_id used at most once)
+    pseudo_ids_used = [pid for _, _, fmt, _, pid in mnem_entries if fmt == 6]
+    check("pseudo IDs are unique (no collisions)",
+          len(set(pseudo_ids_used)) == len(pseudo_ids_used))
+
+    # Every pseudo in the binary has a known pseudo_id assignment
+    for name, _, fmt, _, pid in mnem_entries:
+        if fmt == 6:
+            check(f"pseudo '{name}': pseudo_id {pid} matches expected",
+                  name in EXPECTED_PSEUDO_IDS and pid == EXPECTED_PSEUDO_IDS[name])
+
     # ═══════════════════════════════════════════════════════════
     # [4] Register table verification
     # ═══════════════════════════════════════════════════════════
@@ -524,6 +557,27 @@ def main():
     # x0-x31 via "x" prefix is always available (handled in code, not table)
     # ABI table should cover all 32 via named entries
     check("all 32 registers reachable via ABI names", reachable == set(range(32)))
+
+    # Completeness: every expected register ABI name must be present
+    reg_names_set = {name for name, _ in reg_entries}
+    missing_regs = [r for r in EXPECTED_REGS if r not in reg_names_set]
+    check("all expected register ABI names present",
+          len(missing_regs) == 0)
+    for r in missing_regs:
+        print(f"         missing expected register: {r}")
+
+    # Verify critical aliases (fp == s0) exist
+    fp_entry = [(n, num) for n, num in reg_entries if n == 'fp']
+    s0_entry = [(n, num) for n, num in reg_entries if n == 's0']
+    check("fp alias is present and maps to x8 (same as s0)",
+          len(fp_entry) == 1 and fp_entry[0][1] == 8)
+    check("s0 is present and maps to x8",
+          len(s0_entry) == 1 and s0_entry[0][1] == 8)
+
+    # Verify zero always maps to x0 (critical for correctness)
+    zero_entry = [(n, num) for n, num in reg_entries if n == 'zero']
+    check("zero always maps to x0",
+          len(zero_entry) == 1 and zero_entry[0][1] == 0)
 
     # ═══════════════════════════════════════════════════════════
     # [5] Instruction encoder correctness (Z3)
@@ -1215,10 +1269,8 @@ def main():
                 break
 
     # ═══════════════════════════════════════════════════════════
-    # [8] Branch coverage test suite
+    # Instruction-level binary simulator (used by [9] and [10])
     # ═══════════════════════════════════════════════════════════
-    print("\n[8] Branch coverage test suite")
-
     CODE_BASE = 0x80000000
     CODE_SIZE = len(binary)
 
@@ -1397,6 +1449,166 @@ def main():
         if isinstance(s, str):
             return s.encode('ascii') + b'\x04'
         return s + b'\x04'
+
+    # ═══════════════════════════════════════════════════════════
+    # [8] Output loop + shutdown verification
+    # ═══════════════════════════════════════════════════════════
+    print("\n[8] Output loop + shutdown")
+
+    # Main output loop (0x127c-0x1298):
+    #   0x127c: beq s1, s2, 0x129c   — done → shutdown
+    #   0x1280: lbu t3, 0(s1)        — read byte
+    #   0x1284: addi s1, s1, 1       — advance
+    #   0x1288: lbu t0, 5(s5)        — UART LSR
+    #   0x128c: andi t0, t0, 32      — TX-ready bit
+    #   0x1290: beq t0, zero, 0x1288 — wait
+    #   0x1294: sb t3, 0(s5)         — TX
+    #   0x1298: jal zero, 0x127c     — loop
+    #
+    # Shutdown (0x129c-0x12ac):
+    #   0x129c: lui s5, 0x00100000
+    #   0x12a0: lui t0, 0x00005000
+    #   0x12a4: addi t0, t0, 1365    — 0x5000 + 1365 = 0x5555
+    #   0x12a8: sw t0, 0(s5)         — poweroff
+    #   0x12ac: jal zero, 0x12ac     — fallback self-loop
+
+    w_out_done = words[0x127c // 4]
+    check("0x127c: beq s1, s2 → shutdown (output done)",
+          rv_opcode(w_out_done) == 0x63 and rv_funct3(w_out_done) == 0
+          and rv_rs1(w_out_done) == 9 and rv_rs2(w_out_done) == 18
+          and (0x127c + rv_imm_b(w_out_done)) == 0x129c)
+
+    w_out_read = words[0x1280 // 4]
+    check("0x1280: lbu t3, 0(s1) (read buffer byte)",
+          rv_opcode(w_out_read) == 0x03 and rv_funct3(w_out_read) == 4
+          and rv_rd(w_out_read) == 28 and rv_rs1(w_out_read) == 9
+          and rv_imm_i(w_out_read) == 0)
+
+    w_out_adv = words[0x1284 // 4]
+    check("0x1284: addi s1, s1, 1 (advance read ptr)",
+          rv_opcode(w_out_adv) == 0x13 and rv_funct3(w_out_adv) == 0
+          and rv_rd(w_out_adv) == 9 and rv_rs1(w_out_adv) == 9
+          and rv_imm_i(w_out_adv) == 1)
+
+    w_out_tx = words[0x1294 // 4]
+    check("0x1294: sb t3, 0(s5) (UART TX)",
+          rv_opcode(w_out_tx) == 0x23 and rv_funct3(w_out_tx) == 0
+          and rv_rs1(w_out_tx) == 21 and rv_rs2(w_out_tx) == 28
+          and rv_imm_s(w_out_tx) == 0)
+
+    w_out_loop = words[0x1298 // 4]
+    check("0x1298: jal zero → 0x127c (loop back)",
+          rv_opcode(w_out_loop) == 0x6F and rv_rd(w_out_loop) == 0
+          and (0x1298 + rv_imm_j(w_out_loop)) == 0x127c)
+
+    # Z3 invariants for the output loop (same shape as fam0/fam1)
+    os1 = BitVec('o_s1', 32)
+    os2 = BitVec('o_s2', 32)
+    # Output buffer is at 0x82000000 in fam2 (5744 binary size makes it less
+    # tight, but the invariant only needs an upper bound — use 64MB region).
+    OUT_BUF_LO = 0x82000000
+    OUT_BUF_HI = OUT_BUF_LO + 0x04000000
+    OUT_INV = And(
+        UGE(os1, C(OUT_BUF_LO)), ULE(os1, os2),
+        UGE(os2, C(OUT_BUF_LO)), ULT(os2, C(OUT_BUF_HI)),
+    )
+
+    prove("output: read address in output buffer",
+        ForAll([os1, os2], Implies(
+            And(OUT_INV, os1 != os2),
+            And(UGE(os1, C(OUT_BUF_LO)), ULT(os1, C(OUT_BUF_HI))))))
+
+    prove("output: invariant preserved after advance",
+        ForAll([os1, os2], Implies(
+            And(OUT_INV, os1 != os2),
+            And(UGE(os1 + 1, C(OUT_BUF_LO)), ULE(os1 + 1, os2)))))
+
+    prove("output: progress (s1 strictly increases)",
+        ForAll([os1, os2], Implies(
+            And(OUT_INV, os1 != os2), UGT(os1 + 1, os1))))
+
+    # Shutdown sequence from bit fields
+    w_shut_base = words[0x129c // 4]
+    w_shut_hi   = words[0x12a0 // 4]
+    w_shut_lo   = words[0x12a4 // 4]
+    w_shut_st   = words[0x12a8 // 4]
+    w_shut_halt = words[0x12ac // 4]
+
+    check("shutdown: 0x129c lui s5, 0x00100000",
+          rv_opcode(w_shut_base) == 0x37 and rv_rd(w_shut_base) == 21
+          and rv_imm_u(w_shut_base) == 0x00100000)
+
+    check("shutdown: 0x12a0/0x12a4 build value in t0",
+          rv_opcode(w_shut_hi) == 0x37 and rv_rd(w_shut_hi) == 5
+          and rv_opcode(w_shut_lo) == 0x13 and rv_rd(w_shut_lo) == 5
+          and rv_rs1(w_shut_lo) == 5)
+
+    check("shutdown: 0x12a8 sw t0, 0(s5)",
+          rv_opcode(w_shut_st) == 0x23 and rv_funct3(w_shut_st) == 2
+          and rv_rs1(w_shut_st) == 21 and rv_rs2(w_shut_st) == 5
+          and rv_imm_s(w_shut_st) == 0)
+
+    check("shutdown: 0x12ac jal zero → 0x12ac (fallback self-loop)",
+          rv_opcode(w_shut_halt) == 0x6F and rv_rd(w_shut_halt) == 0
+          and (0x12ac + rv_imm_j(w_shut_halt)) == 0x12ac)
+
+    prove("shutdown: MMIO address == 0x00100000",
+        C(rv_imm_u(w_shut_base)) == C(0x00100000))
+    prove("shutdown: MMIO value == 0x00005555 (QEMU sifive poweroff)",
+        C(rv_imm_u(w_shut_hi)) + C(rv_imm_i(w_shut_lo)) == C(0x00005555))
+
+    # ═══════════════════════════════════════════════════════════
+    # [9] Binary vs Python simulator equivalence
+    # ═══════════════════════════════════════════════════════════
+    # fam2 is a mnemonic assembler, so "fam2(fam2.fam1)" is not a
+    # meaningful self-bootstrap (fam2.fam1 is in fam1 hex syntax).
+    # Instead we verify end-to-end correctness of the actual binary:
+    # feed the same 10 mnemonic programs from [6] to the real binary
+    # simulator and check the output matches the Python model.
+    # Combined with [7] cross-check (fam1 assembles bin/fam2), this
+    # anchors fam2 from both directions.
+    print("\n[9] Binary vs Python simulator equivalence")
+
+    bin_sim_tests = [
+        ("addi+add",          test1, expected1),
+        ("sw+lw",             test2, expected2),
+        ("forward branch",    test3, expected3),
+        ("backward branch",   test4, expected4),
+        ("pseudos",           test5, expected5),
+        ("lui U-type",        test6, expected6),
+        ("hex passthrough",   test7, expected7),
+        ("comments",          test8, expected8),
+        ("li large imm",      test9, expected9),
+        ("beqz pseudo",       test10, expected10),
+    ]
+
+    bin_sim_pass = 0
+    for name, src, expected in bin_sim_tests:
+        src_bytes = src.encode('ascii')
+        if not src_bytes.endswith(b'\x04'):
+            src_bytes += b'\x04'
+        out, _ = simulate_fam2_bin(binary, src_bytes)
+        ok = (out == expected)
+        check(f"binary matches simulator: {name}", ok)
+        if ok:
+            bin_sim_pass += 1
+        else:
+            # Show first diff
+            for i in range(min(len(out), len(expected))):
+                if out[i] != expected[i]:
+                    print(f"         first mismatch at byte {i}: "
+                          f"got 0x{out[i]:02x}, expected 0x{expected[i]:02x}")
+                    break
+            if len(out) != len(expected):
+                print(f"         length: got {len(out)}, expected {len(expected)}")
+
+    check(f"all {len(bin_sim_tests)} mnemonic programs: binary ≡ simulator",
+          bin_sim_pass == len(bin_sim_tests))
+
+    # ═══════════════════════════════════════════════════════════
+    # [10] Branch coverage test suite
+    # ═══════════════════════════════════════════════════════════
+    print("\n[10] Branch coverage test suite")
 
     # Identify all B-type branches
     branch_pcs = []
@@ -1782,14 +1994,194 @@ def main():
     tests.append(("slti neg", make_input("slti a0, a1, -5\n"), None))
     tests.append(("sltiu", make_input("sltiu a0, a1, 100\n"), None))
 
+    # 57. Long label names — force fixup-name-matching to compare past word 0.
+    # Labels are stored in 32-byte (8-word) zero-padded buffers; the matcher
+    # at 0x1108-0x115c does 8 word-level lw+bne comparisons. To exercise the
+    # "mismatch at word N" (taken) path during fixup resolution, we need:
+    #   (a) FORWARD references (so fam2 cannot resolve inline and creates a fixup)
+    #   (b) two labels whose names match at word 0 but differ at some later word
+    # During resolution the fixup name is compared against EACH symbol in turn;
+    # if the fixup points at one of two names with a shared prefix, the word-N
+    # mismatch triggers.
+    tests.append(("fixup match w0, diff w1",
+                  make_input(
+                      "j abcdEFG1\n"                # 8 chars, differ at pos 7
+                      "abcdEFG0:\n"                  # first symbol in table
+                      "abcdEFG1:\n"                  # second symbol in table
+                  ), None))
+    tests.append(("fixup match w0-1, diff w2",
+                  make_input(
+                      "j abcdEFGHi1\n"              # 10 chars, differ at pos 9
+                      "abcdEFGHi0:\n"
+                      "abcdEFGHi1:\n"
+                  ), None))
+    tests.append(("fixup match w0-2, diff w3",
+                  make_input(
+                      "j abcdEFGHijkl1\n"           # 13 chars, differ at pos 12
+                      "abcdEFGHijkl0:\n"
+                      "abcdEFGHijkl1:\n"
+                  ), None))
+    tests.append(("fixup match w0-2, diff w3",
+                  make_input(
+                      "j abcdEFGHijklMNOP1\n"        # 17 chars
+                      "abcdEFGHijklMNOP0:\n"
+                      "abcdEFGHijklMNOP1:\n"
+                  ), None))
+    tests.append(("fixup match w0-3, diff w4",
+                  make_input(
+                      "j abcdEFGHijklMNOPqrst1\n"    # 21 chars
+                      "abcdEFGHijklMNOPqrst0:\n"
+                      "abcdEFGHijklMNOPqrst1:\n"
+                  ), None))
+    tests.append(("fixup match w0-4, diff w5",
+                  make_input(
+                      "j abcdEFGHijklMNOPqrstUVWX1\n"  # 25 chars
+                      "abcdEFGHijklMNOPqrstUVWX0:\n"
+                      "abcdEFGHijklMNOPqrstUVWX1:\n"
+                  ), None))
+    tests.append(("fixup match w0-5, diff w6",
+                  make_input(
+                      "j abcdEFGHijklMNOPqrstUVWXyyyz1\n"  # 29 chars
+                      "abcdEFGHijklMNOPqrstUVWXyyyz0:\n"
+                      "abcdEFGHijklMNOPqrstUVWXyyyz1:\n"
+                  ), None))
+    # 31-char names to hit word 7
+    tests.append(("fixup match w0-6, diff w7",
+                  make_input(
+                      "j abcdEFGHijklMNOPqrstUVWXyyyyy1\n"  # 31 chars
+                      "abcdEFGHijklMNOPqrstUVWXyyyyy0:\n"
+                      "abcdEFGHijklMNOPqrstUVWXyyyyy1:\n"
+                  ), None))
+
+    # 58. Negative li edge cases — to exercise li sign extension and blt a0
+    tests.append(("li just below -2048 (needs lui)",
+                  make_input("li a0, -2049\n"), None))
+    tests.append(("li exactly -2048 (fits addi)",
+                  make_input("li a0, -2048\n"), None))
+    tests.append(("li exactly 0x800 (needs lui)",
+                  make_input("li a0, 0x800\n"), None))
+    tests.append(("li negative large",
+                  make_input("li a0, -0x100000\n"), None))
+
+    # 59. Mixed call-site coverage: alternate mnemonic types in one program
+    # to exercise different dispatcher sites (gp return paths).
+    tests.append(("varied dispatch mix",
+                  make_input(
+                      "add a0, a0, a1\n"        # R-type
+                      "sub a0, a0, a1\n"        # R-type
+                      "addi a0, a0, 1\n"        # I-type
+                      "lw a0, 0(sp)\n"          # load
+                      "sw a0, 0(sp)\n"          # store
+                      "lui a0, 0x100\n"         # U-type
+                      "auipc a0, 0x100\n"       # U-type
+                      "top:\n"
+                      "bne a0, zero, top\n"     # branch backward
+                      "jal ra, end\n"           # J-type
+                      "end:\n"
+                  ), None))
+
+    # 60. Many instructions before labels (stress label table scan)
+    nops = "nop\n" * 20
+    tests.append(("many instructions + fixup",
+                  make_input(nops + "j target\n" + nops + "target:\n"), None))
+
+    # 61. Dispatcher coverage — call each mnemonic type twice in different orders
+    tests.append(("R-type x2 different orderings",
+                  make_input(
+                      "add a0, a0, a1\n"
+                      "sub a1, a0, a0\n"
+                      "xor a2, a0, a1\n"
+                      "or a3, a1, a2\n"
+                      "and a4, a2, a3\n"
+                      "add a5, a3, a4\n"
+                  ), None))
+
+    tests.append(("I-type x2 different orderings",
+                  make_input(
+                      "addi a0, a0, 1\n"
+                      "addi a1, a0, 2\n"
+                      "andi a2, a1, 3\n"
+                      "ori a3, a2, 4\n"
+                      "xori a4, a3, 5\n"
+                      "addi a5, a4, 6\n"
+                  ), None))
+
+    # 62. TX delay tests — cover the "not-ready → retry" taken direction
+    # of the UART TX polling branches (0x1270 and 0x1290).
+    tests.append(("TX poll delay on first byte",
+                  make_input("addi a0, zero, 1\n"), None, {0}))
+    tests.append(("TX poll delay on several bytes",
+                  make_input("addi a0, zero, 1\naddi a1, zero, 2\n"),
+                  None, {0, 4, 8}))
+
+    # 63. Stress test — many instructions of diverse types to exercise
+    # dispatcher branches (each dispatcher covers call sites for a callee;
+    # a richer mix of contexts exercises more of them).
+    stress = []
+    regs_a = ['a0','a1','a2','a3','a4','a5']
+    for i in range(6):
+        stress.append(f"addi {regs_a[i]}, zero, {i+1}")
+    for i in range(5):
+        stress.append(f"add {regs_a[i]}, {regs_a[i]}, {regs_a[i+1]}")
+    for i in range(5):
+        stress.append(f"sub {regs_a[i+1]}, {regs_a[i+1]}, {regs_a[i]}")
+    for i in range(5):
+        stress.append(f"and a0, a0, {regs_a[i]}")
+    for i in range(5):
+        stress.append(f"or a1, a1, {regs_a[i]}")
+    for i in range(5):
+        stress.append(f"xor a2, a2, {regs_a[i]}")
+    for i in range(5):
+        stress.append(f"slli {regs_a[i]}, {regs_a[i]}, {i+1}")
+    for i in range(5):
+        stress.append(f"srli {regs_a[i]}, {regs_a[i]}, {i+1}")
+    for i in range(4):
+        stress.append(f"sw {regs_a[i]}, {i*4}(sp)")
+    for i in range(4):
+        stress.append(f"lw {regs_a[i]}, {i*4}(sp)")
+    stress.append("top:")
+    stress.append("addi a0, a0, 1")
+    stress.append("bne a0, a1, top")
+    stress.append("beq a0, a2, end")
+    stress.append("blt a0, a3, end")
+    stress.append("bge a0, a4, end")
+    stress.append("bltu a5, a0, end")
+    stress.append("bgeu a0, a5, end")
+    stress.append("j top")
+    stress.append("end:")
+    stress.append("nop")
+    tests.append(("stress: diverse mix", make_input("\n".join(stress) + "\n"), None))
+
+    # 64. Number-parse edge cases. Number parser has signed-range checks at
+    # 0xeec/0xef4 and digit-range checks. Exercise with extreme and boundary
+    # immediate values.
+    tests.append(("imm 0x7FFFFFFF (INT_MAX)",
+                  make_input("li a0, 0x7FFFFFFF\n"), None))
+    tests.append(("imm 0xFFFFFFFF (-1 unsigned)",
+                  make_input("li a0, 0xFFFFFFFF\n"), None))
+    tests.append(("imm 0x80000000 (INT_MIN)",
+                  make_input("li a0, 0x80000000\n"), None))
+    tests.append(("imm 10-digit decimal",
+                  make_input("li a0, 2147483647\n"), None))
+    tests.append(("imm many-digit decimal",
+                  make_input("li a0, 1234567890\n"), None))
+    tests.append(("imm negative decimal",
+                  make_input("li a0, -123456\n"), None))
+
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
     test_pass = 0
     test_total = 0
 
-    for name, inp, rx_d in tests:
+    for entry in tests:
+        # Support both 3-tuple (name, inp, rx_d) and 4-tuple (name, inp, rx_d, tx_d)
+        if len(entry) == 3:
+            name, inp, rx_d = entry
+            tx_d = None
+        else:
+            name, inp, rx_d, tx_d = entry
         test_total += 1
         try:
-            out, blog = simulate_fam2_bin(binary, inp, rx_d, None)
+            out, blog = simulate_fam2_bin(binary, inp, rx_d, tx_d)
             test_pass += 1
             for pc_addr in blog:
                 if pc_addr in global_branches:
@@ -1816,7 +2208,16 @@ def main():
     else:
         print(f"\n  Full coverage: all {len(branch_pcs)} branches exercised in both directions")
 
-    check(f"branch coverage ≥ 80% ({pct:.1f}%)", pct >= 80.0)
+    # Remaining uncovered directions are predominantly:
+    #   - per-callsite dispatchers (`bne gp, zero` patterns) that fire only
+    #     when a callee is invoked from specific sites that our test programs
+    #     don't all reach
+    #   - error paths in number parsing (`blt a0, zero → error`) guarding
+    #     against internal states unreachable from valid input
+    # Both classes are covered indirectly by [7] cross-check (fam1 assembling
+    # bin/fam2 exercises the full call graph) and by [9] binary-vs-simulator
+    # equivalence on 10 mnemonic programs.
+    check(f"branch coverage ≥ 85% ({pct:.1f}%)", pct >= 85.0)
 
     # ═══════════════════════════════════════════════════════════
     # Summary
@@ -1833,11 +2234,14 @@ def main():
         print(f"    → ISA: pure RV32I (no jalr/SYSTEM/FENCE/M/A/F/D/C)")
         print(f"    → exhaustive store + load enumeration (known bases only)")
         print(f"    → branch targets mechanically checked")
-        print(f"    → mnemonic table: 42 entries verified, extensions excluded")
-        print(f"    → register table: 33 entries verified")
+        print(f"    → mnemonic table: 42 entries, all expected present, per-format counts verified")
+        print(f"    → pseudo IDs unique and match expected assignment")
+        print(f"    → register table: 33 entries, all ABI names present, fp=s0=x8 verified")
         print(f"    → Z3 encoder proofs: R/I/S/B/U/J all correct")
         print(f"    → B/J-type round-trip encoding proven")
-        print(f"    → concrete tests: 10 test programs assembled correctly")
+        print(f"    → concrete tests: 10 mnemonic programs (simulator model)")
+        print(f"    → output loop + shutdown Z3 properties verified")
+        print(f"    → binary ≡ simulator equivalence on 10 mnemonic programs")
         print(f"    → cross-check: fam1(fam2.fam1) == bin/fam2")
         print(f"    → branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
     return 1 if failed > 0 else 0

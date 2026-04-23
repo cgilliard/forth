@@ -567,6 +567,71 @@ def main():
                         ULT(s2, C(BUF + 0x100000 - 1))),
                     INV_post)))
 
+    # Label-def path (c == ':'): reads 4 name bytes into [s8, s8+4),
+    # writes s2 to [s8+4, s8+8), then s8 += 8.
+    # Model the post-state analytically (the binary does this loop in
+    # hardware; here we reason about the net effect).
+    LABEL_TBL_END = LABEL_TBL + 0x1000
+    FIXUP_TBL_END = FIXUP_TBL + 0x1000
+    s8_after_label = s8 + 8
+    s10_after_fixup = s10 + 8
+
+    # Precondition: label table has room for another 8-byte entry.
+    label_room = ULE(s8 + 8, C(LABEL_TBL_END))
+    fixup_room = ULE(s10 + 8, C(FIXUP_TBL_END))
+
+    # Every store during label-def targets addresses in [s8, s8+8).
+    # The 4 name stores hit s8+0..s8+3; the addr store hits s8+4..s8+7.
+    name_idx = BitVec('name_idx', 32)
+    label_name_addr = s8 + name_idx              # during name-char loop
+    label_addr_store = s8 + 4                     # sw s2, 4(s8)
+
+    prove("label-def: name-char writes land inside label table",
+        ForAll([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, t4, c, name_idx],
+            Implies(And(INV, is_colon, label_room, ULT(name_idx, 4)),
+                    And(UGE(label_name_addr, C(LABEL_TBL)),
+                        ULT(label_name_addr, C(LABEL_TBL_END))))))
+
+    prove("label-def: addr-slot write lands inside label table",
+        ForAll(all_vars,
+            Implies(And(INV, is_colon, label_room),
+                    And(UGE(label_addr_store, C(LABEL_TBL)),
+                        ULT(label_addr_store, C(LABEL_TBL_END))))))
+
+    prove("label-def: s8 += 8 stays within label table",
+        ForAll(all_vars,
+            Implies(And(INV, is_colon, label_room),
+                    And(UGE(s8_after_label, C(LABEL_TBL)),
+                        ULE(s8_after_label, C(LABEL_TBL_END))))))
+
+    # Fixup-ref path (c == '@'): same structure targeting fixup table.
+    fixup_name_addr = s10 + name_idx
+    fixup_addr_store = s10 + 4
+
+    prove("fixup-ref: name-char writes land inside fixup table",
+        ForAll([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, t4, c, name_idx],
+            Implies(And(INV, is_at, fixup_room, ULT(name_idx, 4)),
+                    And(UGE(fixup_name_addr, C(FIXUP_TBL)),
+                        ULT(fixup_name_addr, C(FIXUP_TBL_END))))))
+
+    prove("fixup-ref: addr-slot write lands inside fixup table",
+        ForAll(all_vars,
+            Implies(And(INV, is_at, fixup_room),
+                    And(UGE(fixup_addr_store, C(FIXUP_TBL)),
+                        ULT(fixup_addr_store, C(FIXUP_TBL_END))))))
+
+    prove("fixup-ref: s10 += 8 stays within fixup table",
+        ForAll(all_vars,
+            Implies(And(INV, is_at, fixup_room),
+                    And(UGE(s10_after_fixup, C(FIXUP_TBL)),
+                        ULE(s10_after_fixup, C(FIXUP_TBL_END))))))
+
+    # Disjointness: label table, fixup table, and output buffer do not overlap.
+    prove("disjoint regions: label-tbl ∩ fixup-tbl = ∅",
+        ULE(C(LABEL_TBL_END), C(FIXUP_TBL)))
+    prove("disjoint regions: fixup-tbl ∩ output-buffer = ∅",
+        ULE(C(FIXUP_TBL_END), C(BUF)))
+
     # ═══════════════════════════════════════════════════════════
     # [6] Input loop properties
     # ═══════════════════════════════════════════════════════════
@@ -736,9 +801,107 @@ def main():
                   decoded_off == off)
 
     # ═══════════════════════════════════════════════════════════
-    # [9] Concrete end-to-end: fam1 processes synthetic input
+    # [9] Output loop + shutdown verification
     # ═══════════════════════════════════════════════════════════
-    print("\n[9] Concrete end-to-end: fam1 on synthetic input")
+    print("\n[9] Output loop + shutdown")
+
+    # Output loop (0x210-0x22c):
+    #   0x210: beq s1, s2, end     — done when read ptr == write ptr
+    #   0x214: lbu t3, 0(s1)       — read byte from buffer
+    #   0x218: addi s1, s1, 1      — advance read ptr
+    #   0x21c: lbu t1, 5(s5)       — UART LSR poll
+    #   0x220: andi t1, t1, 32     — check TX-ready bit
+    #   0x224: beq t1, zero, 0x21c — wait until ready
+    #   0x228: sb t3, 0(s5)        — UART TX write
+    #   0x22c: jal zero, 0x210     — loop
+    #
+    # Shutdown (0x230-0x23c):
+    #   0x230: lui s5, 0x00100000  — shutdown MMIO base
+    #   0x234: lui t1, 0x00005000
+    #   0x238: addi t1, t1, 1365   — 0x5000 + 1365 = 0x5555
+    #   0x23c: sw t1, 0(s5)        — write 0x5555 → QEMU sifive shutdown
+
+    # Verify output loop structure directly from bit fields
+    w_out_done = words[0x210 // 4]  # beq s1, s2, end
+    check("0x210: beq s1, s2, end (output done check)",
+          rv_opcode(w_out_done) == 0x63 and rv_funct3(w_out_done) == 0
+          and rv_rs1(w_out_done) == 9 and rv_rs2(w_out_done) == 18
+          and (0x210 + rv_imm_b(w_out_done)) == 0x230)
+
+    w_out_read = words[0x214 // 4]  # lbu t3, 0(s1)
+    check("0x214: lbu t3, 0(s1) (buffer read)",
+          rv_opcode(w_out_read) == 0x03 and rv_funct3(w_out_read) == 4
+          and rv_rd(w_out_read) == 28 and rv_rs1(w_out_read) == 9
+          and rv_imm_i(w_out_read) == 0)
+
+    w_out_adv = words[0x218 // 4]  # addi s1, s1, 1
+    check("0x218: addi s1, s1, 1 (advance read ptr)",
+          rv_opcode(w_out_adv) == 0x13 and rv_funct3(w_out_adv) == 0
+          and rv_rd(w_out_adv) == 9 and rv_rs1(w_out_adv) == 9
+          and rv_imm_i(w_out_adv) == 1)
+
+    w_out_tx = words[0x228 // 4]  # sb t3, 0(s5)
+    check("0x228: sb t3, 0(s5) (UART TX)",
+          rv_opcode(w_out_tx) == 0x23 and rv_funct3(w_out_tx) == 0
+          and rv_rs1(w_out_tx) == 21 and rv_rs2(w_out_tx) == 28
+          and rv_imm_s(w_out_tx) == 0)
+
+    w_out_loop = words[0x22c // 4]  # jal zero, 0x210
+    check("0x22c: jal zero, 0x210 (loop back)",
+          rv_opcode(w_out_loop) == 0x6F and rv_rd(w_out_loop) == 0
+          and (0x22c + rv_imm_j(w_out_loop)) == 0x210)
+
+    # Z3 proofs for output loop invariants
+    os1 = BitVec('os1', 32)
+    os2 = BitVec('os2', 32)
+    OUT_INV = And(
+        UGE(os1, C(BUF)), ULE(os1, os2),
+        UGE(os2, C(BUF)), ULT(os2, C(BUF + 0x100000)),
+    )
+
+    prove("output: read address in buffer",
+        ForAll([os1, os2], Implies(
+            And(OUT_INV, os1 != os2),
+            And(UGE(os1, C(BUF)), ULT(os1, C(BUF + 0x100000))))))
+
+    prove("output: invariant preserved (s1+1 ≤ s2 when s1 ≠ s2)",
+        ForAll([os1, os2], Implies(
+            And(OUT_INV, os1 != os2),
+            And(UGE(os1 + 1, C(BUF)), ULE(os1 + 1, os2)))))
+
+    prove("output: progress (s1 strictly increases)",
+        ForAll([os1, os2], Implies(
+            And(OUT_INV, os1 != os2), UGT(os1 + 1, os1))))
+
+    # Shutdown sequence verification from bit fields
+    w_shut_base = words[0x230 // 4]   # lui s5, 0x00100000
+    w_shut_hi   = words[0x234 // 4]   # lui t1, 0x00005000
+    w_shut_lo   = words[0x238 // 4]   # addi t1, t1, 1365
+    w_shut_st   = words[0x23c // 4]   # sw t1, 0(s5)
+
+    check("shutdown: 0x230 loads MMIO base into s5",
+          rv_opcode(w_shut_base) == 0x37 and rv_rd(w_shut_base) == 21
+          and rv_imm_u(w_shut_base) == 0x00100000)
+
+    check("shutdown: 0x234/0x238 build value in t1",
+          rv_opcode(w_shut_hi) == 0x37 and rv_rd(w_shut_hi) == 6
+          and rv_opcode(w_shut_lo) == 0x13 and rv_rd(w_shut_lo) == 6
+          and rv_rs1(w_shut_lo) == 6)
+
+    check("shutdown: 0x23c stores t1 to s5",
+          rv_opcode(w_shut_st) == 0x23 and rv_funct3(w_shut_st) == 2
+          and rv_rs1(w_shut_st) == 21 and rv_rs2(w_shut_st) == 6
+          and rv_imm_s(w_shut_st) == 0)
+
+    prove("shutdown: MMIO address == 0x00100000",
+        C(rv_imm_u(w_shut_base)) == C(0x00100000))
+    prove("shutdown: MMIO value == 0x00005555 (QEMU sifive poweroff)",
+        C(rv_imm_u(w_shut_hi)) + C(rv_imm_i(w_shut_lo)) == C(0x00005555))
+
+    # ═══════════════════════════════════════════════════════════
+    # [10] Concrete end-to-end: fam1 processes synthetic input
+    # ═══════════════════════════════════════════════════════════
+    print("\n[10] Concrete end-to-end: fam1 on synthetic input")
 
     # Simulate fam1's full algorithm on a synthetic input that uses
     # labels and fixups, then verify the output.
@@ -974,9 +1137,9 @@ def main():
               patched_back_off == -4)
 
     # ═══════════════════════════════════════════════════════════
-    # [10] Concrete: fam0(fam1.fam0) == bin/fam1 (cross-check)
+    # [11] Concrete: fam0(fam1.fam0) == bin/fam1 (cross-check)
     # ═══════════════════════════════════════════════════════════
-    print("\n[10] Cross-check: fam0(fam1.fam0) == bin/fam1")
+    print("\n[11] Cross-check: fam0(fam1.fam0) == bin/fam1")
 
     fam1_src_path = os.path.join(BASE, 'src', 'fam1.fam0')
     fam1_bin_path = os.path.join(BASE, 'bin', 'fam1')
@@ -1023,10 +1186,8 @@ def main():
           bytes(fam0_output) == fam1_expected)
 
     # ═══════════════════════════════════════════════════════════
-    # [11] Branch coverage test suite
+    # Instruction-level binary simulator (used by [12] and [13])
     # ═══════════════════════════════════════════════════════════
-    print("\n[11] Branch coverage test suite")
-
     CODE_BASE = 0x80000000
 
     def simulate_fam1_bin(binary, input_bytes, rx_delays=None, tx_delays=None):
@@ -1195,6 +1356,41 @@ def main():
             return s.encode('ascii') + b'\x04'
         return s + b'\x04'
 
+    # ═══════════════════════════════════════════════════════════
+    # [12] Fixed point: fam1(fam1.fam0) == bin/fam1
+    # ═══════════════════════════════════════════════════════════
+    # Unlike [11] which runs an algorithmic fam0 simulator, this
+    # executes the actual fam1 binary instruction-by-instruction
+    # on fam1's own source and verifies the output matches bin/fam1.
+    # Since fam1.fam0 contains pure fam0 syntax (no labels/fixups),
+    # this exercises fam1 as a strict superset of fam0.
+    print("\n[12] Fixed point: fam1(fam1.fam0) == bin/fam1")
+
+    with open(fam1_src_path, 'rb') as f:
+        fam1_src_bytes = f.read()
+    if not fam1_src_bytes.endswith(b'\x04'):
+        fam1_src_bytes += b'\x04'
+
+    self_out, _ = simulate_fam1_bin(binary, fam1_src_bytes)
+
+    check(f"fam1(fam1.fam0) length matches bin/fam1 "
+          f"({len(self_out)} == {len(fam1_expected)})",
+          len(self_out) == len(fam1_expected))
+    check("fam1(fam1.fam0) bytes match bin/fam1 exactly (fixed point)",
+          self_out == fam1_expected)
+
+    if self_out != fam1_expected:
+        for i in range(min(len(self_out), len(fam1_expected))):
+            if self_out[i] != fam1_expected[i]:
+                print(f"         first mismatch at byte {i}: "
+                      f"got 0x{self_out[i]:02x}, expected 0x{fam1_expected[i]:02x}")
+                break
+
+    # ═══════════════════════════════════════════════════════════
+    # [13] Branch coverage test suite
+    # ═══════════════════════════════════════════════════════════
+    print("\n[13] Branch coverage test suite")
+
     # Identify all branch instructions
     branch_pcs = []
     branch_labels = {}
@@ -1346,6 +1542,111 @@ def main():
          ), None, None, None),
     ]
 
+    # Helpers to build expected byte sequences with patched immediates
+    def enc_b_imm(offset):
+        o = offset & 0xFFFFFFFF
+        enc = 0
+        enc |= (((o >> 12) & 1) << 31)
+        enc |= (((o >> 5) & 0x3F) << 25)
+        enc |= (((o >> 1) & 0xF) << 8)
+        enc |= (((o >> 11) & 1) << 7)
+        return enc & 0xFFFFFFFF
+
+    def enc_j_imm(offset):
+        o = offset & 0xFFFFFFFF
+        enc = 0
+        enc |= (((o >> 20) & 1) << 31)
+        enc |= (((o >> 1) & 0x3FF) << 21)
+        enc |= (((o >> 11) & 1) << 20)
+        enc |= (((o >> 12) & 0xFF) << 12)
+        return enc & 0xFFFFFFFF
+
+    def w32(v):
+        return struct.pack('<I', v & 0xFFFFFFFF)
+
+    # Semantic tests — verify patched byte sequences match expected
+    # Layout: instruction 0 at byte 0, instruction 1 at byte 4, etc.
+    # All base opcodes (before patching) have funct3/rs1/rs2=0, rd=0.
+    NOP    = 0x00000013   # addi zero, zero, 0
+    BEQ_0  = 0x00000063   # beq zero, zero, 0 (placeholder)
+    JAL_0  = 0x0000006F   # jal zero, 0 (placeholder)
+
+    semantic_tests = [
+        # Two fixups to the same forward label — both must decode to the
+        # same offset-to-label relationship.
+        ("two fixups, same forward label",
+         make_input(
+             "63 00 00 00\n"      # byte 0: beq placeholder → needs @DEST
+             "@DEST\n"
+             "63 00 00 00\n"      # byte 4: beq placeholder → needs @DEST
+             "@DEST\n"
+             "13 00 00 00\n"      # byte 8: nop (filler)
+             ":DEST\n"
+             "13 05 A0 00\n"      # byte 12: addi a0, zero, 10
+         ),
+         w32(BEQ_0 | enc_b_imm(12 - 0)) +   # beq → +12
+         w32(BEQ_0 | enc_b_imm(12 - 4)) +   # beq → +8
+         w32(NOP) +
+         bytes([0x13, 0x05, 0xA0, 0x00]),
+         None, None),
+
+        # Backward jal after multiple labels.
+        ("backward jal past multiple labels",
+         make_input(
+             ":AAAA\n"
+             "13 05 A0 00\n"      # byte 0
+             ":BBBB\n"
+             "13 05 B0 00\n"      # byte 4
+             ":CCCC\n"
+             "13 05 C0 00\n"      # byte 8
+             "6F 00 00 00\n"      # byte 12: jal placeholder
+             "@AAAA\n"            # → byte 0
+         ),
+         bytes([0x13, 0x05, 0xA0, 0x00,
+                0x13, 0x05, 0xB0, 0x00,
+                0x13, 0x05, 0xC0, 0x00]) +
+         w32(JAL_0 | enc_j_imm(0 - 12)),   # offset -12
+         None, None),
+
+        # Mixed forward + backward, B and J in one program.
+        ("mixed forward+backward, B+J",
+         make_input(
+             ":START\n"
+             "63 00 00 00\n"      # byte 0: beq → @END (forward)
+             "@END\n"
+             "13 00 00 00\n"      # byte 4: nop
+             "6F 00 00 00\n"      # byte 8: jal → @START (backward)
+             "@START\n"
+             ":END\n"
+             "13 05 A0 00\n"      # byte 12
+         ),
+         w32(BEQ_0 | enc_b_imm(12 - 0)) +    # +12
+         w32(NOP) +
+         w32(JAL_0 | enc_j_imm(0 - 8)) +     # -8
+         bytes([0x13, 0x05, 0xA0, 0x00]),
+         None, None),
+
+        # Many labels — exercises the label-table linear scan past several
+        # non-matching entries before finding the match.
+        ("four labels, match is last",
+         make_input(
+             ":AAAA\n"
+             "13 00 00 00\n"      # byte 0
+             ":BBBB\n"
+             "13 00 00 00\n"      # byte 4
+             ":CCCC\n"
+             "13 00 00 00\n"      # byte 8
+             ":DDDD\n"
+             "6F 00 00 00\n"      # byte 12: jal → @DDDD
+             "@DDDD\n"
+         ),
+         bytes([0x13, 0x00, 0x00, 0x00] * 3) +
+         w32(JAL_0 | enc_j_imm(12 - 12)),   # offset = 0
+         None, None),
+    ]
+
+    tests = tests + semantic_tests
+
     global_branches = {pc_addr: set() for pc_addr in branch_pcs}
 
     for name, inp, expected, rx_d, tx_d in tests:
@@ -1403,10 +1704,13 @@ def main():
         print(f"    → branch targets mechanically checked")
         print(f"    → initialization: all 11 setup instructions verified")
         print(f"    → Z3 invariant induction (hex loop, nibble packing)")
+        print(f"    → Z3 invariant induction (label-def, fixup-ref paths)")
         print(f"    → B-type encoding: Z3 proves correctness for all offsets")
         print(f"    → J-type encoding: Z3 proves correctness for all offsets")
+        print(f"    → output loop + shutdown Z3 properties verified")
         print(f"    → concrete tests: forward B, forward J, backward B")
         print(f"    → cross-check: fam0(fam1.fam0) == bin/fam1")
+        print(f"    → fixed point: fam1(fam1.fam0) == bin/fam1")
         print(f"    → branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
     return 1 if failed > 0 else 0
 
