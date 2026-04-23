@@ -30,6 +30,8 @@ failed = 0
 
 DRIVER_BIN = None
 TABERNACLE_BIN = None
+ALIGNED_DRIVER_BIN = None
+ALIGNED_TABERNACLE_BIN = None
 
 def check(name, cond):
     global passed, failed
@@ -71,10 +73,35 @@ def qemu_build(asm_path, *src_files):
 
 
 DRIVER_PAD_SIZE = 150000
+ALIGNED_PAD_SIZE = 134400  # 96 chunks, exactly 3 batches (32*1400*3)
+
+def build_tabernacle_for(binary, name, tmp_dir):
+    """Build a tabernacle configured for the given binary. Returns path."""
+    h = gimli_hash(binary)
+    words = struct.unpack('<8I', h)
+
+    config_path = os.path.join(tmp_dir, f'{name}_config.inc')
+    with open(config_path, 'w') as f:
+        f.write(f".equ\tBIN_SIZE,\t\t{len(binary)}\n")
+        for i, w in enumerate(words):
+            f.write(f".equ\tBIN_HASH{i},\t\t0x{w:08X}\n")
+        f.write("\n")
+
+    tab_data = qemu_build(
+        os.path.join(BASE, 'bin', 'fam3'),
+        config_path,
+        os.path.join(BASE, 'src', 'tabernacle.fam3'),
+    )
+    tab_path = os.path.join(tmp_dir, name)
+    with open(tab_path, 'wb') as f:
+        f.write(tab_data)
+    return tab_path, len(tab_data)
+
 
 def build_test_artifacts():
-    """Build test driver binary and matching tabernacle."""
+    """Build test driver binaries and matching tabernacles."""
     global DRIVER_BIN, TABERNACLE_BIN
+    global ALIGNED_DRIVER_BIN, ALIGNED_TABERNACLE_BIN
 
     tmp_dir = os.path.join(BASE, 'tmp')
     os.makedirs(tmp_dir, exist_ok=True)
@@ -84,37 +111,28 @@ def build_test_artifacts():
         os.path.join(BASE, 'bin', 'forth'),
         os.path.join(BASE, 'tests', 'driver.forth'),
     )
-    # Pad to force multi-batch downloads (32 chunks/batch * 1400 bytes = 44800/batch)
+
+    # Main driver: 150KB, not aligned to batch boundary
     DRIVER_BIN = raw + b'\x00' * (DRIVER_PAD_SIZE - len(raw))
     chunks = (len(DRIVER_BIN) + CHUNK_SIZE - 1) // CHUNK_SIZE
     batches = (chunks + 31) // 32
 
-    driver_path = os.path.join(tmp_dir, 'test_driver')
-    with open(driver_path, 'wb') as f:
-        f.write(DRIVER_BIN)
-
-    h = gimli_hash(DRIVER_BIN)
-    words = struct.unpack('<8I', h)
-
-    config_path = os.path.join(tmp_dir, 'test_tabernacle_config.inc')
-    with open(config_path, 'w') as f:
-        f.write(f".equ\tBIN_SIZE,\t\t{len(DRIVER_BIN)}\n")
-        for i, w in enumerate(words):
-            f.write(f".equ\tBIN_HASH{i},\t\t0x{w:08X}\n")
-        f.write("\n")
-
     print("Building test tabernacle...")
-    tab_data = qemu_build(
-        os.path.join(BASE, 'bin', 'fam3'),
-        config_path,
-        os.path.join(BASE, 'src', 'tabernacle.fam3'),
-    )
-    TABERNACLE_BIN = os.path.join(tmp_dir, 'test_tabernacle')
-    with open(TABERNACLE_BIN, 'wb') as f:
-        f.write(tab_data)
-
+    TABERNACLE_BIN, tab_size = build_tabernacle_for(
+        DRIVER_BIN, 'test_tabernacle', tmp_dir)
     print(f"  driver: {len(DRIVER_BIN)} bytes ({chunks} chunks, {batches} batches)")
-    print(f"  tabernacle: {len(tab_data)} bytes")
+    print(f"  tabernacle: {tab_size} bytes")
+
+    # Aligned driver: exactly on batch boundary
+    ALIGNED_DRIVER_BIN = raw + b'\x00' * (ALIGNED_PAD_SIZE - len(raw))
+    a_chunks = ALIGNED_PAD_SIZE // CHUNK_SIZE
+    a_batches = a_chunks // 32
+
+    print("Building batch-aligned tabernacle...")
+    ALIGNED_TABERNACLE_BIN, a_tab_size = build_tabernacle_for(
+        ALIGNED_DRIVER_BIN, 'test_tabernacle_aligned', tmp_dir)
+    print(f"  aligned driver: {len(ALIGNED_DRIVER_BIN)} bytes ({a_chunks} chunks, {a_batches} batches)")
+    print(f"  aligned tabernacle: {a_tab_size} bytes")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -259,12 +277,12 @@ class ReorderFamcServer(FamcServer):
 
 Q32 = os.path.join(BASE, 'tools', 'q32')
 
-def run_tabernacle(stdin_text, timeout_s=30, disk_path=None):
+def run_tabernacle(stdin_text, timeout_s=30, disk_path=None, tabernacle=None):
     """Run tabernacle in QEMU and return (stdout, exit_code, elapsed_s)."""
     cmd = [Q32, '--net']
     if disk_path:
         cmd += [f'--disk={disk_path}']
-    cmd.append(TABERNACLE_BIN)
+    cmd.append(tabernacle or TABERNACLE_BIN)
 
     start = time.monotonic()
     try:
@@ -675,6 +693,46 @@ def test_reordered_chunks():
         os.unlink(disk)
 
 
+def test_no_seeds_respond():
+    """Seeds listed but none respond — should timeout and print N."""
+    print("\n[18] No seeds respond: probe timeout")
+
+    disk = make_disk()
+    try:
+        stdin = '1234 2000 5.6.7.7:9999 8.8.8.8:1234\x04'
+        out, rc, elapsed = run_tabernacle(stdin, timeout_s=15, disk_path=disk)
+
+        check("exit code 0", rc == 0)
+        check("output contains N", 'N' in out)
+        check("no successful boot", 'Data:' not in out)
+        check("completed in under 10s", elapsed < 10)
+        check("took at least 1s (not instant)", elapsed > 1.0)
+    finally:
+        os.unlink(disk)
+
+
+def test_batch_boundary():
+    """Binary size exactly on batch boundary (96 chunks = 3 batches)."""
+    print("\n[19] Batch boundary: size is exact multiple of batch size")
+
+    srv = FamcServer(ALIGNED_DRIVER_BIN)
+    srv.start()
+    disk = make_disk()
+    try:
+        stdin = f'1234 2000 10.0.2.2:{srv.port}\x04'
+        out, rc, elapsed = run_tabernacle(
+            stdin, timeout_s=45, disk_path=disk,
+            tabernacle=ALIGNED_TABERNACLE_BIN)
+
+        check("exit code 0", rc == 0)
+        check("output contains data hash (successful download)",
+              "Data:" in out)
+        check("a1=1 (net boot)", "a1: 00 00 00 01" in out)
+    finally:
+        srv.stop()
+        os.unlink(disk)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
@@ -710,6 +768,8 @@ if __name__ == '__main__':
     test_junk_traffic()
     test_replay_dos()
     test_reordered_chunks()
+    test_no_seeds_respond()
+    test_batch_boundary()
 
     print("\n" + "=" * 60)
     total = passed + failed
