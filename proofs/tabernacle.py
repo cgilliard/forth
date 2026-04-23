@@ -2379,6 +2379,64 @@ def main():
             print(f"    {branch_labels[pc_addr]}  [{t_mark}{n_mark}] {status}")
 
     # ═══════════════════════════════════════════════════════════
+    # [6b] Cross-check: fam3(tabernacle.fam3) == bin/tabernacle
+    # ═══════════════════════════════════════════════════════════
+    # Chain-based verification: simulate fam3's assembler on tabernacle.fam3
+    # (using the shared model in proofs/fam3_asm.py), verify output matches
+    # bin/tabernacle byte-for-byte. Closes the chain for tabernacle, mirroring
+    # fam3(forth.fam3)==bin/forth in proofs/forth.py.
+    #
+    # Note: tabernacle.fam3 is built with a config prepended (tabernacle_config.inc
+    # has .equ BIN_SIZE / BIN_HASH* defines). The build script concatenates the
+    # config onto the source; we do the same here.
+    print("\n[6b] Cross-check: fam3(tabernacle.fam3) == bin/tabernacle")
+
+    from fam3_asm import parse_fam3_tables, simulate_fam3 as sim_fam3
+
+    tab_src_path    = os.path.join(BASE, 'src', 'tabernacle.fam3')
+    tab_config_path = os.path.join(BASE, 'src', 'tabernacle_config.inc')
+    tab_bin_path    = os.path.join(BASE, 'bin', 'tabernacle')
+
+    if not (os.path.exists(fam3_path) and os.path.exists(tab_src_path)
+            and os.path.exists(tab_bin_path)):
+        print("  SKIP  bin/fam3, src/tabernacle.fam3, or bin/tabernacle missing")
+    else:
+        with open(fam3_path, 'rb') as f:
+            fam3_binary_for_xcheck = f.read()
+        with open(tab_src_path, 'r') as f:
+            tab_src = f.read()
+        with open(tab_bin_path, 'rb') as f:
+            tab_expected = f.read()
+        if os.path.exists(tab_config_path):
+            with open(tab_config_path, 'r') as f:
+                tab_config = f.read()
+            # Build script prepends config onto source
+            full_src = tab_config + tab_src
+        else:
+            full_src = tab_src
+
+        fam3_mnem, fam3_regs = parse_fam3_tables(fam3_binary_for_xcheck)
+        check(f"fam3 mnem table parsed ({len(fam3_mnem)} entries, expected 64)",
+              len(fam3_mnem) == 64)
+        check(f"fam3 reg table parsed ({len(fam3_regs)} entries, expected 33)",
+              len(fam3_regs) == 33)
+
+        tab_out = sim_fam3(full_src, fam3_mnem, fam3_regs)
+
+        check(f"fam3(tabernacle.fam3) length matches bin/tabernacle "
+              f"({len(tab_out)} == {len(tab_expected)})",
+              len(tab_out) == len(tab_expected))
+        check("fam3(tabernacle.fam3) bytes match bin/tabernacle exactly",
+              tab_out == tab_expected)
+
+        if tab_out != tab_expected:
+            for i in range(min(len(tab_out), len(tab_expected))):
+                if tab_out[i] != tab_expected[i]:
+                    print(f"         first mismatch at byte {i} (0x{i:04x}): "
+                          f"got 0x{tab_out[i]:02x}, expected 0x{tab_expected[i]:02x}")
+                    break
+
+    # ═══════════════════════════════════════════════════════════
     # [7] QEMU end-to-end tests
     # ═══════════════════════════════════════════════════════════
     print("\n[7] QEMU end-to-end tests")
@@ -2431,6 +2489,7 @@ def main():
             print(f"    [5] gimli_hash verified (official test vector + {len(gimli_test_sizes)} assembly tests)")
             print(f"    [6] branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
             print(f"        download writes verified within bounds across {len(coverage_tests)} tests")
+            print(f"    [6b] chain cross-check: fam3(tabernacle.fam3) == bin/tabernacle")
             print(f"    [7] {passed - pre_qemu_passed} QEMU end-to-end tests passed")
 
     return 1 if failed > 0 else 0
