@@ -917,6 +917,13 @@ rx_ret_batch:
 	lbu	t0, 41(a2)
 	lbu	t1, 3(s2)
 	bne	t0, t1, batch_ignore
+	# Verify UDP source port matches locked seed.
+	lbu	t0, 46(a2)
+	lbu	t1, 5(s2)
+	bne	t0, t1, batch_ignore
+	lbu	t0, 47(a2)
+	lbu	t1, 4(s2)
+	bne	t0, t1, batch_ignore
 
 	# Check seq is in current batch range.
 	# a1 = seq (chunk index)
@@ -962,10 +969,7 @@ rx_ret_batch:
 	addi	t0, t0, -15		# data_len
 
 	# Clamp: don't copy past BIN_SIZE.
-	li	t3, BIN_SIZE
-	lla	t4, endmark
-	sub	t3, t3, t0		# max offset for dest start... no.
-	# Actually: remaining = BIN_SIZE - (seq * CHUNK_SIZE)
+	# remaining = BIN_SIZE - (seq * CHUNK_SIZE)
 	slli	t3, a1, 10
 	slli	t4, a1, 8
 	add	t3, t3, t4
@@ -975,6 +979,7 @@ rx_ret_batch:
 	sub	t3, t3, t4		# t3 = seq * CHUNK_SIZE
 	li	t4, BIN_SIZE
 	sub	t3, t4, t3		# remaining = BIN_SIZE - offset
+	blez	t3, batch_ignore	# offset >= BIN_SIZE, discard
 	blt	t0, t3, copy_no_clamp
 	mv	t0, t3
 copy_no_clamp:
