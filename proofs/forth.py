@@ -1280,20 +1280,27 @@ def main():
                   bye_words[14] == 0x00428313)
             check("bye: word 15 = sw t1, 0(t0) (0x0062A023)",
                   bye_words[15] == 0x0062A023)
-        if len(bye_words) > 16:
-            check("bye: word 16 = jal x0, +64 (0x0400006F)",
-                  bye_words[16] == 0x0400006F)
-        # Error handler at words 17-31 (15 instructions)
-        if len(bye_words) > 31:
+        # Words 16-23: save __a0-__a7 to data region
+        if len(bye_words) > 23:
+            for i in range(8):
+                expected = [0x00AB2023, 0x00BB2223, 0x00CB2423, 0x00DB2623,
+                            0x00EB2823, 0x00FB2A23, 0x010B2C23, 0x011B2E23][i]
+                check(f"bye: word {16+i} = sw a{i}, {i*4}(s6) (0x{expected:08X})",
+                      bye_words[16+i] == expected)
+        if len(bye_words) > 24:
+            check("bye: word 24 = jal x0, +64 (0x0400006F)",
+                  bye_words[24] == 0x0400006F)
+        # Error handler at words 25-39 (15 instructions)
+        if len(bye_words) > 39:
             check("bye: error handler starts with addi t0, 0, 0x21",
-                  bye_words[17] == 0x02100293)
+                  bye_words[25] == 0x02100293)
             check("bye: error handler ends with jal x0, 0 (halt)",
-                  bye_words[31] == 0x0000006F)
+                  bye_words[39] == 0x0000006F)
 
         # Verify bye emits correct shutdown sequence (after prologue + error handler)
         bye_expected = [0x00100AB7, 0x000052B7, 0x55528293, 0x005AA023]
-        if len(bye_words) >= 36:
-            bye_tail = bye_words[32:36]
+        if len(bye_words) >= 44:
+            bye_tail = bye_words[40:44]
             check("bye: shutdown sequence correct",
                   bye_tail == bye_expected)
 
