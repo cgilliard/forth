@@ -16,7 +16,9 @@ run() {
 	[ $# -gt 0 ] && echo "Building $*" >&2
 	([ $# -gt 0 ] && cat "$@"; printf '\004') | qemu-system-riscv32 \
 		-machine virt -cpu "$CPU" \
-		-nographic -bios none \
+		-display none -bios none \
+		-chardev stdio,id=ser0,mux=off,signal=off \
+		-serial chardev:ser0 \
 		-device loader,file="$asm",addr=0x80000000 \
 		$disk_args
 }
@@ -28,31 +30,27 @@ run bin/fam1 src/fam2.fam1 > bin/fam2
 run bin/fam2 src/fam3.fam2 > bin/fam3
 run bin/fam3 src/forth.fam3 > bin/forth
 run bin/fam3 src/build_full_node.fam3 > bin/build_full_node
+run bin/fam3 src/gen_bin_config.fam3 > bin/gen_bin_config
 run bin/forth src/full_node.forth > bin/full_node
 
-# Prepare work disk: full_node (sector-padded) | bible (sector-padded) | output space
+# Prepare work disk: fn ++ bible concatenated, sector-padded.
+# build_full_node reads sizes from stdin, reads fn+bible from disk sector 0,
+# patches in place, writes back to sector 0, emits final_size on stdout.
 FN_SIZE=$(wc -c < bin/full_node)
 BD_SIZE=$(wc -c < resources/bible.compressed)
-FN_SECTORS=$(( (FN_SIZE + 511) / 512 ))
-BD_SECTORS=$(( (BD_SIZE + 511) / 512 ))
-TOTAL=$((FN_SIZE + BD_SIZE))
-PAD=$(( (4 - TOTAL % 4) % 4 ))
-FINAL_SIZE=$((TOTAL + PAD + 4))
-FINAL_SECTORS=$(( (FINAL_SIZE + 511) / 512 ))
+cat bin/full_node resources/bible.compressed > tmp/work.img
+truncate -s %512 tmp/work.img
 
-dd if=bin/full_node of=tmp/work.img bs=512 conv=sync 2>/dev/null
-dd if=resources/bible.compressed bs=512 conv=sync >> tmp/work.img 2>/dev/null
-dd if=/dev/zero bs=512 count=$((FINAL_SECTORS + 1)) >> tmp/work.img 2>/dev/null
+printf '%s %s\n' "$FN_SIZE" "$BD_SIZE" > tmp/sizes.txt
+run bin/build_full_node --disk tmp/work.img tmp/sizes.txt > tmp/final_size.txt
 
-# build_full_node reads sizes from stdin, reads data from disk,
-# patches binary, computes hash, writes result to disk, emits config
-echo "$FN_SIZE $BD_SIZE" > tmp/sizes.txt
-run bin/build_full_node --disk tmp/work.img tmp/sizes.txt > src/tabernacle_config.inc
+# Extract patched binary (first final_size bytes of the disk).
+head -c "$(cat tmp/final_size.txt)" tmp/work.img > bin/full_node
 
-# Extract patched full_node from output area of disk
-OUT_SECTOR=$((FN_SECTORS + BD_SECTORS))
-dd if=tmp/work.img of=bin/full_node bs=1 skip=$((OUT_SECTOR * 512)) count=$FINAL_SIZE 2>/dev/null
-echo "Patched bin/full_node ($FINAL_SIZE bytes)" >&2
+# gen_bin_config reads size from stdin, payload from disk sector 0,
+# emits tabernacle_config.inc.
+run bin/gen_bin_config --disk tmp/work.img tmp/final_size.txt > src/tabernacle_config.inc
+
 run bin/fam3 src/tabernacle_config.inc src/tabernacle.fam3 > bin/tabernacle
 
 echo "Success!"

@@ -1,24 +1,27 @@
-# gen_bin_config.fam3 -- reads full_node binary from a virtio-blk disk,
-# computes Gimli-hash, and writes bin_config.inc to stdout (UART TX).
+# gen_bin_config.fam3 -- reads "<size>\n" from UART, reads <size> bytes
+# from disk sector 0, computes Gimli-hash, writes tabernacle_config.inc
+# to UART.
 #
-# Disk image layout (created by build.sh):
-#   Sector 0:  4-byte LE payload length at offset 0, rest zero-padded
-#   Sector 1+: raw payload bytes, last sector zero-padded to 512
+# Disk layout:
+#   Sector 0..: raw payload bytes, sector-padded tail
 #
-# Usage (see build.sh):
-#   qemu-system-riscv32 ... \
-#     -device loader,file=bin/gen_bin_config,addr=0x80000000 \
-#     -drive file=tmp/full_node.img,format=raw,if=none,id=hd0 \
-#     -device virtio-blk-device,drive=hd0
+# Input (UART RX):
+#   "<size>\n"
+#
+# Output (UART TX):
+#   .equ BIN_SIZE,  <size>
+#   .equ BIN_HASH0, 0x...
+#   ... (8 hash words)
 
 # ── Platform constants ───────────────────────────────────────────────────
 .equ	UART_BASE,		0x10000000
 .equ	UART_LSR,		5
 .equ	UART_TX_READY,		0x20
+.equ	UART_RX_READY,		0x01
 .equ	SHUTDOWN_ADDR,		0x00100000
 .equ	SHUTDOWN_VAL,		0x5555
 
-# ── Virtio MMIO (legacy interface) ──────────────────────────────────────
+# ── Virtio MMIO ─────────────────────────────────────────────────────────
 .equ	VIO_MAGIC,		0x000
 .equ	VIO_DEVICE_ID,		0x008
 .equ	VIO_DRIVER_FEATURES,	0x020
@@ -32,12 +35,6 @@
 .equ	VIRT_MAGIC,		0x74726976
 
 # ── Memory layout ───────────────────────────────────────────────────────
-# Virtio queue at QUEUE_BASE (page-aligned):
-#   +0x0000  descriptor table (16 × 16 bytes)
-#   +0x0100  available ring
-#   +0x1000  used ring
-#   +0x1200  disk status byte
-#   +0x1202  request header (16 bytes)
 .equ	QUEUE_BASE,		0x80004000
 .equ	VIRT_DESC,		0
 .equ	VIRT_STATUS,		4608
@@ -47,15 +44,14 @@
 .equ	STACK_TOP,		0x81000000
 
 # ══════════════════════════════════════════════════════════════════════════
-# _start: init virtio-blk, read payload from disk, hash, format, shutdown.
+# _start: init virtio, read size from UART, read payload from disk, hash,
+# emit config, shutdown.
 # ══════════════════════════════════════════════════════════════════════════
 _start:
 	lui	sp, 0x81000
-
-	# s11 = virtio queue base (page-aligned, used by disk_read)
 	lui	s11, 0x80004
 
-	# Zero 16 KiB queue region (4096 words).
+	# Zero queue region
 	addi	t0, s11, 0
 	li	t1, 4096
 zero_loop:
@@ -64,7 +60,7 @@ zero_loop:
 	addi	t1, t1, -1
 	bnez	t1, zero_loop
 
-	# Scan QEMU-virt virtio MMIO slots for device_id=2 (blk).
+	# Scan for virtio-blk
 	li	s3, 0x10008000
 scan_disk:
 	li	t0, 0x10001000
@@ -81,7 +77,6 @@ scan_next:
 	j	scan_disk
 
 found_disk:
-	# Legacy virtio-blk handshake (same sequence as tabernacle.fam3).
 	sw	zero, VIO_STATUS(s3)
 	li	t1, 1
 	sw	t1, VIO_STATUS(s3)
@@ -108,114 +103,84 @@ found_disk:
 	ori	t1, t1, 4
 	sw	t1, VIO_STATUS(s3)
 
-	# -- Phase 1: read sector 0 to get payload length --
-	li	a0, 0			# sector 0
-	li	a1, 1			# avail_idx
-	lui	a2, 0x80100		# dest = BUF_BASE
-	li	a3, 512
+	# ── Phase 1: Read payload size from UART ────────────────────────
+	li	s6, 0			# avail_idx
 	li	gp, 0
-	j	disk_read
-dr_ret_hdr:
-	lui	t0, 0x80100
-	lw	s4, 0(t0)		# s4 = payload length
+	j	read_decimal
+rd_ret_sz:
+	addi	s4, a0, 0		# s4 = payload size
+
 	li	t0, BUF_MAX_LEN
 	bgeu	s4, t0, input_too_big
 
-	# -- Phase 2: read payload from sectors 1+ into BUF_BASE --
-	lui	s0, 0x80100		# dest ptr
+	# ── Phase 2: Read payload from disk sector 0 ────────────────────
+	lui	s0, 0x80100
 	addi	s1, s4, 511
 	li	t0, -512
-	and	s1, s1, t0		# bytes remaining (sector-rounded)
-	li	s2, 1			# starting sector
-	li	s6, 1			# avail idx (1 already used)
-read_loop:
-	beqz	s1, read_done
-	li	a3, 65536
-	bge	s1, a3, read_go
-	addi	a3, s1, 0
-read_go:
-	addi	a0, s2, 0		# sector
-	addi	s6, s6, 1
-	addi	a1, s6, 0		# avail idx
-	addi	a2, s0, 0		# dest
-	addi	sp, sp, -4
-	sw	a3, 0(sp)		# save chunk size
-	li	gp, 1
-	j	disk_read
-dr_ret_data:
-	lw	t0, 0(sp)		# recover chunk size
-	addi	sp, sp, 4
-	srli	t1, t0, 9		# sectors in this chunk
-	add	s2, s2, t1
-	bge	s1, t0, read_full
-	addi	t0, s1, 0
-read_full:
-	add	s0, s0, t0
-	sub	s1, s1, t0
-	j	read_loop
+	and	s1, s1, t0		# bytes rounded up to sector
+	li	s2, 0			# starting sector
+	li	s7, 0			# phase = read
+	j	bulk_read
+br_ret:
 
-read_done:
-	# Allocate 32-byte hash output on the stack.
+	# ── Phase 3: Compute Gimli hash ─────────────────────────────────
 	addi	sp, sp, -32
-	addi	s3, sp, 0		# s3 = hash output ptr
+	addi	s3, sp, 0		# s3 = 32-byte hash output
 
-	# Call gimli_hash(data=BUF_BASE, len=s4, out=s3).
 	lui	a0, 0x80100
 	addi	a1, s4, 0
 	addi	a2, s3, 0
-	li	gp, 0			# gp=0 → gh_ret
+	li	gp, 0
 	j	gimli_hash
 
 gh_ret:
-	# -- Header lines --
+	# ── Phase 4: Emit config ────────────────────────────────────────
 	lla	a0, hdr1
-	li	gp, 0			# gp=0 → es_ret_h1
+	li	gp, 0
 	j	emit_str
 es_ret_h1:
 	lla	a0, hdr2
-	li	gp, 1			# gp=1 → es_ret_h2
+	li	gp, 1
 	j	emit_str
 es_ret_h2:
 
-	# -- ".equ\tBIN_SIZE,\t\t<len>\n" --
 	lla	a0, size_prefix
-	li	gp, 2			# gp=2 → es_ret_sz
+	li	gp, 2
 	j	emit_str
 es_ret_sz:
 	addi	a0, s4, 0
-	li	gp, 0			# gp=0 → ed_ret
+	li	gp, 0
 	j	emit_dec
 ed_ret:
-	li	a0, 10			# '\n'
-	li	gp, 0			# gp=0 → ec_ret_nlsz
+	li	a0, 10
+	li	gp, 0
 	j	emit_char
 ec_ret_nlsz:
 
-	# -- 8 x ".equ\tBIN_HASH<i>,\t\t0x<word>\n" --
-	li	s5, 0			# i
+	li	s5, 0
 hash_loop:
 	li	t0, 8
 	bge	s5, t0, hash_done
 	lla	a0, hash_prefix
-	li	gp, 3			# gp=3 → es_ret_hp
+	li	gp, 3
 	j	emit_str
 es_ret_hp:
-	addi	a0, s5, 48		# '0' + i
-	li	gp, 1			# gp=1 → ec_ret_dig
+	addi	a0, s5, 48
+	li	gp, 1
 	j	emit_char
 ec_ret_dig:
 	lla	a0, hash_mid
-	li	gp, 4			# gp=4 → es_ret_hm
+	li	gp, 4
 	j	emit_str
 es_ret_hm:
 	slli	t0, s5, 2
 	add	t0, s3, t0
 	lw	a0, 0(t0)
-	li	gp, 0			# gp=0 → eh_ret
+	li	gp, 0
 	j	emit_hex8
 eh_ret:
-	li	a0, 10			# '\n'
-	li	gp, 2			# gp=2 → ec_ret_nlh
+	li	a0, 10
+	li	gp, 2
 	j	emit_char
 ec_ret_nlh:
 	addi	s5, s5, 1
@@ -229,19 +194,10 @@ hang:
 	wfi
 	j	hang
 
-input_too_big:
-	lla	a0, err_too_big
-	li	gp, 5			# gp=5 → es_ret_err
-	j	emit_str
-es_ret_err:
-	li	t0, SHUTDOWN_ADDR
-	li	t1, SHUTDOWN_VAL
-	sw	t1, 0(t0)
-	j	hang
-
+# ── Error handlers ───────────────────────────────────────────────────────
 no_disk:
 	lla	a0, err_no_disk
-	li	gp, 6			# gp=6 → es_ret_nd
+	li	gp, 6
 	j	emit_str
 es_ret_nd:
 	li	t0, SHUTDOWN_ADDR
@@ -249,158 +205,87 @@ es_ret_nd:
 	sw	t1, 0(t0)
 	j	hang
 
-# ══════════════════════════════════════════════════════════════════════════
-# emit_char -- write the byte in a0 (low 8 bits) to the UART.
-# Dispatch sites: gp=0 ec_ret_nlsz, gp=1 ec_ret_dig, gp=2 ec_ret_nlh.
-# Clobbers: t0, t1.
-# ══════════════════════════════════════════════════════════════════════════
-emit_char:
-	li	t0, UART_BASE
-ec_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, ec_wait
-	sb	a0, 0(t0)
-emit_char_disp:
-	beqz	gp, ec_ret_nlsz
-	li	t0, 1
-	beq	gp, t0, ec_ret_dig
-	li	t0, 2
-	beq	gp, t0, ec_ret_nlh
-	j	dispatch_error
+input_too_big:
+	lla	a0, err_too_big
+	li	gp, 5
+	j	emit_str
+es_ret_err:
+	li	t0, SHUTDOWN_ADDR
+	li	t1, SHUTDOWN_VAL
+	sw	t1, 0(t0)
+	j	hang
 
 # ══════════════════════════════════════════════════════════════════════════
-# emit_str -- write the null-terminated string at a0 to the UART.
-# Dispatch sites: gp=0..6 (see uses above).
-# Clobbers: t0, t1, t2, t3.
+# read_decimal -- read unsigned decimal from UART. Dispatch: gp=0 rd_ret_sz.
 # ══════════════════════════════════════════════════════════════════════════
-emit_str:
-	addi	t3, a0, 0		# read ptr
-	li	t2, UART_BASE
-es_loop:
-	lbu	t0, 0(t3)
-	beqz	t0, es_done
-es_wait:
-	lbu	t1, UART_LSR(t2)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, es_wait
-	sb	t0, 0(t2)
-	addi	t3, t3, 1
-	j	es_loop
-es_done:
-emit_str_disp:
-	beqz	gp, es_ret_h1
-	li	t0, 1
-	beq	gp, t0, es_ret_h2
-	li	t0, 2
-	beq	gp, t0, es_ret_sz
-	li	t0, 3
-	beq	gp, t0, es_ret_hp
-	li	t0, 4
-	beq	gp, t0, es_ret_hm
-	li	t0, 5
-	beq	gp, t0, es_ret_err
-	li	t0, 6
-	beq	gp, t0, es_ret_nd
-	j	dispatch_error
-
-# ══════════════════════════════════════════════════════════════════════════
-# emit_dec -- write the unsigned decimal value in a0 to the UART.
-# Dispatch sites: gp=0 ed_ret.
-# Clobbers: t0..t6, a0.
-# ══════════════════════════════════════════════════════════════════════════
-emit_dec:
-	addi	sp, sp, -20
-	sw	gp, 16(sp)
-	bnez	a0, ed_nonzero
-	li	a0, 48
-	li	t2, UART_BASE
-ed_zero_wait:
-	lbu	t1, UART_LSR(t2)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, ed_zero_wait
-	sb	a0, 0(t2)
-	j	ed_epilogue
-ed_nonzero:
-	addi	t3, sp, 16		# write ptr (grows downward)
-	li	t4, 0			# digit count
-ed_gen:
-	beqz	a0, ed_emit
-	addi	t5, zero, 0		# quotient
-	addi	t6, a0, 0		# remainder
-ed_div:
-	li	t0, 10
-	blt	t6, t0, ed_div_done
-	sub	t6, t6, t0
-	addi	t5, t5, 1
-	j	ed_div
-ed_div_done:
-	addi	t3, t3, -1
-	addi	t6, t6, 48		# '0' + digit
-	sb	t6, 0(t3)
-	addi	t4, t4, 1
-	addi	a0, t5, 0
-	j	ed_gen
-ed_emit:
-	li	t2, UART_BASE
-ed_emit_loop:
-	beqz	t4, ed_epilogue
-ed_emit_wait:
-	lbu	t1, UART_LSR(t2)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, ed_emit_wait
-	lbu	t5, 0(t3)
-	sb	t5, 0(t2)
-	addi	t3, t3, 1
-	addi	t4, t4, -1
-	j	ed_emit_loop
-ed_epilogue:
-	lw	gp, 16(sp)
-	addi	sp, sp, 20
-emit_dec_disp:
-	beqz	gp, ed_ret
-	j	dispatch_error
-
-# ══════════════════════════════════════════════════════════════════════════
-# emit_hex8 -- write the 32-bit word in a0 as 8 uppercase hex digits.
-# Dispatch sites: gp=0 eh_ret.
-# Clobbers: t0..t5.
-# ══════════════════════════════════════════════════════════════════════════
-emit_hex8:
+read_decimal:
 	addi	sp, sp, -4
 	sw	gp, 0(sp)
-	li	t4, 7			# shift counter (7*4=28 down to 0)
+	li	a0, 0
 	li	t2, UART_BASE
-eh_loop:
-	slli	t3, t4, 2		# shift amount = t4 * 4
-	srl	t0, a0, t3		# t0 = a0 >> shift
-	andi	t0, t0, 0xF		# nibble
-	li	t1, 10
-	blt	t0, t1, eh_digit
-	addi	t0, t0, 55		# 'A' - 10
-	j	eh_emit
-eh_digit:
-	addi	t0, t0, 48		# '0'
-eh_emit:
-eh_wait:
+rd_skip:
 	lbu	t1, UART_LSR(t2)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, eh_wait
-	sb	t0, 0(t2)
-	addi	t4, t4, -1
-	bgez	t4, eh_loop
+	andi	t1, t1, UART_RX_READY
+	beqz	t1, rd_skip
+	lbu	t1, 0(t2)
+	addi	t3, t1, -48
+	bltz	t3, rd_skip
+	li	t4, 9
+	bgt	t3, t4, rd_skip
+	addi	a0, t3, 0
+rd_loop:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_RX_READY
+	beqz	t1, rd_loop
+	lbu	t1, 0(t2)
+	addi	t3, t1, -48
+	bltz	t3, rd_done
+	li	t4, 9
+	bgt	t3, t4, rd_done
+	slli	t4, a0, 3
+	slli	t5, a0, 1
+	add	a0, t4, t5
+	add	a0, a0, t3
+	j	rd_loop
+rd_done:
 	lw	gp, 0(sp)
 	addi	sp, sp, 4
-emit_hex8_disp:
-	beqz	gp, eh_ret
+read_decimal_disp:
+	beqz	gp, rd_ret_sz
 	j	dispatch_error
 
 # ══════════════════════════════════════════════════════════════════════════
-# disk_read -- read sectors via virtio-blk (duplicated from tabernacle).
-#   Input: a0 = starting sector, a1 = avail_idx,
-#          a2 = dest buffer, a3 = byte count
-#          s3 = disk base address, s11 = queue base
-#   Clobbers: t0..t5
+# bulk_read -- read s1 bytes from disk sector s2 into s0.
+# Dispatch: s7=0 br_ret.
+# ══════════════════════════════════════════════════════════════════════════
+bulk_read:
+	beqz	s1, bulk_read_done
+	li	a3, 65536
+	bge	s1, a3, br_go
+	addi	a3, s1, 0
+br_go:
+	addi	a0, s2, 0
+	addi	s6, s6, 1
+	addi	a1, s6, 0
+	addi	a2, s0, 0
+	addi	sp, sp, -4
+	sw	a3, 0(sp)
+	j	disk_read
+bulk_read_cont:
+	lw	t0, 0(sp)
+	addi	sp, sp, 4
+	srli	t1, t0, 9
+	add	s2, s2, t1
+	add	s0, s0, t0
+	sub	s1, s1, t0
+	j	bulk_read
+bulk_read_done:
+	beqz	s7, br_ret
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# disk_read -- single virtio-blk read.
+# a0=sector, a1=avail_idx, a2=dest, a3=byte count.
 # ══════════════════════════════════════════════════════════════════════════
 disk_read:
 	li	t5, VIRT_DESC
@@ -453,10 +338,145 @@ dr_poll:
 	lbu	t4, 0(t3)
 	beq	t4, t5, dr_poll
 	.word	0x0220000F
-disk_read_disp:
-	beqz	gp, dr_ret_hdr
+	j	bulk_read_cont
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_char -- write byte in a0 to UART. Dispatch: gp=0..2.
+# ══════════════════════════════════════════════════════════════════════════
+emit_char:
+	li	t0, UART_BASE
+ec_wait:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ec_wait
+	sb	a0, 0(t0)
+emit_char_disp:
+	beqz	gp, ec_ret_nlsz
 	li	t0, 1
-	beq	gp, t0, dr_ret_data
+	beq	gp, t0, ec_ret_dig
+	li	t0, 2
+	beq	gp, t0, ec_ret_nlh
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_str -- write null-terminated string at a0 to UART.
+# Dispatch: gp=0..6.
+# ══════════════════════════════════════════════════════════════════════════
+emit_str:
+	addi	t3, a0, 0
+	li	t2, UART_BASE
+es_loop:
+	lbu	t0, 0(t3)
+	beqz	t0, es_done
+es_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, es_wait
+	sb	t0, 0(t2)
+	addi	t3, t3, 1
+	j	es_loop
+es_done:
+emit_str_disp:
+	beqz	gp, es_ret_h1
+	li	t0, 1
+	beq	gp, t0, es_ret_h2
+	li	t0, 2
+	beq	gp, t0, es_ret_sz
+	li	t0, 3
+	beq	gp, t0, es_ret_hp
+	li	t0, 4
+	beq	gp, t0, es_ret_hm
+	li	t0, 5
+	beq	gp, t0, es_ret_err
+	li	t0, 6
+	beq	gp, t0, es_ret_nd
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_dec -- write unsigned decimal in a0 to UART. Dispatch: gp=0.
+# ══════════════════════════════════════════════════════════════════════════
+emit_dec:
+	addi	sp, sp, -20
+	sw	gp, 16(sp)
+	bnez	a0, ed_nonzero
+	li	a0, 48
+	li	t2, UART_BASE
+ed_zero_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ed_zero_wait
+	sb	a0, 0(t2)
+	j	ed_epilogue
+ed_nonzero:
+	addi	t3, sp, 16
+	li	t4, 0
+ed_gen:
+	beqz	a0, ed_emit
+	addi	t5, zero, 0
+	addi	t6, a0, 0
+ed_div:
+	li	t0, 10
+	blt	t6, t0, ed_div_done
+	sub	t6, t6, t0
+	addi	t5, t5, 1
+	j	ed_div
+ed_div_done:
+	addi	t3, t3, -1
+	addi	t6, t6, 48
+	sb	t6, 0(t3)
+	addi	t4, t4, 1
+	addi	a0, t5, 0
+	j	ed_gen
+ed_emit:
+	li	t2, UART_BASE
+ed_emit_loop:
+	beqz	t4, ed_epilogue
+ed_emit_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ed_emit_wait
+	lbu	t5, 0(t3)
+	sb	t5, 0(t2)
+	addi	t3, t3, 1
+	addi	t4, t4, -1
+	j	ed_emit_loop
+ed_epilogue:
+	lw	gp, 16(sp)
+	addi	sp, sp, 20
+emit_dec_disp:
+	beqz	gp, ed_ret
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_hex8 -- write 32-bit word as 8 hex digits. Dispatch: gp=0.
+# ══════════════════════════════════════════════════════════════════════════
+emit_hex8:
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+	li	t4, 7
+	li	t2, UART_BASE
+eh_loop:
+	slli	t3, t4, 2
+	srl	t0, a0, t3
+	andi	t0, t0, 0xF
+	li	t1, 10
+	blt	t0, t1, eh_digit
+	addi	t0, t0, 55
+	j	eh_emit
+eh_digit:
+	addi	t0, t0, 48
+eh_emit:
+eh_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, eh_wait
+	sb	t0, 0(t2)
+	addi	t4, t4, -1
+	bgez	t4, eh_loop
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+emit_hex8_disp:
+	beqz	gp, eh_ret
 	j	dispatch_error
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -763,13 +783,13 @@ dispatch_error:
 	j	dispatch_error
 
 # ══════════════════════════════════════════════════════════════════════════
-# Data: null-terminated output strings.
+# Data
 # ══════════════════════════════════════════════════════════════════════════
 hdr1:
-	.ascii	"# bin_config.inc -- auto-generated by gen_bin_config\n"
+	.ascii	"# tabernacle_config.inc -- auto-generated by gen_bin_config\n"
 	.byte	0
 hdr2:
-	.ascii	"# Hash function: gimli-hash (rate=16, capacity=32, output=32)\n"
+	.ascii	"# Hash: gimli-hash (rate=16, capacity=32, output=32)\n"
 	.byte	0
 size_prefix:
 	.ascii	".equ\tBIN_SIZE,\t\t"
