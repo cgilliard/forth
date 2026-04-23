@@ -1675,6 +1675,569 @@ def main():
         print("  SKIP  QEMU not available for comparison")
 
     # ═══════════════════════════════════════════════════════════
+    # [8b] Cross-check: fam3(forth.fam3) == bin/forth
+    # ═══════════════════════════════════════════════════════════
+    # The chain-based verification: load bin/fam3 (already trusted by
+    # proofs/fam3.py), parse its mnemonic/register tables, simulate its
+    # assembler algorithm on forth.fam3 source, and verify the output
+    # byte-for-byte against bin/forth. This mirrors the cross-check present
+    # in every prior stage: fam0(fam1.fam0)==bin/fam1, fam1(fam2.fam1)==bin/fam2,
+    # fam2(fam3.fam2)==bin/fam3. Closes the chain verification for forth.
+    print("\n[8b] Cross-check: fam3(forth.fam3) == bin/forth")
+
+    fam3_bin_path = os.path.join(BASE, 'bin', 'fam3')
+    forth_src_path = os.path.join(BASE, 'src', 'forth.fam3')
+
+    if not (os.path.exists(fam3_bin_path) and os.path.exists(forth_src_path)):
+        print("  SKIP  bin/fam3 or src/forth.fam3 missing")
+    else:
+        with open(fam3_bin_path, 'rb') as f:
+            fam3_binary = f.read()
+        with open(forth_src_path, 'r') as f:
+            forth_src = f.read()
+
+        # Parse fam3's mnem and reg tables from its binary.
+        # Fixed layout (per proofs/fam3.py):
+        #   0x000c: mnem table, 64 entries × 12 bytes (8B name + class + f3 + f7 + pad)
+        #   0x031c: reg table,  33 entries × 8 bytes  (4B name + 4B reg_num)
+        FAM3_MNEM_OFFSET = 0x000c
+        FAM3_MNEM_ENTRY_SIZE = 12
+        FAM3_MNEM_COUNT = 64
+        FAM3_REG_OFFSET = 0x031c
+        FAM3_REG_ENTRY_SIZE = 8
+        FAM3_REG_COUNT = 33
+
+        fam3_mnem_table = {}
+        for j in range(FAM3_MNEM_COUNT):
+            off = FAM3_MNEM_OFFSET + j * FAM3_MNEM_ENTRY_SIZE
+            name_bytes = fam3_binary[off:off+8]
+            if name_bytes[0] == 0:
+                break
+            name = name_bytes.split(b'\x00')[0].decode('ascii')
+            cls = fam3_binary[off + 8]
+            mf3 = fam3_binary[off + 9]
+            mf7 = fam3_binary[off + 10]
+            fam3_mnem_table[name] = (cls, mf3, mf7)
+
+        fam3_reg_table = {}
+        for j in range(FAM3_REG_COUNT):
+            off = FAM3_REG_OFFSET + j * FAM3_REG_ENTRY_SIZE
+            name_bytes = fam3_binary[off:off+4]
+            if name_bytes == b'\x00\x00\x00\x00':
+                break
+            name = name_bytes.split(b'\x00')[0].decode('ascii')
+            reg_num = struct.unpack_from('<I', fam3_binary, off + 4)[0]
+            fam3_reg_table[name] = reg_num
+
+        check(f"fam3 mnem table parsed ({len(fam3_mnem_table)} entries, expected 64)",
+              len(fam3_mnem_table) == 64)
+        check(f"fam3 reg table parsed ({len(fam3_reg_table)} entries, expected 33)",
+              len(fam3_reg_table) == 33)
+
+        # Encoder helpers (same semantics as fam3.py's)
+        def _enc_r(opcode, rd, f3, rs1, rs2, f7):
+            return (opcode | (rd << 7) | (f3 << 12) | (rs1 << 15) | (rs2 << 20) | (f7 << 25)) & 0xFFFFFFFF
+
+        def _enc_i(opcode, rd, f3, rs1, imm):
+            return (opcode | (rd << 7) | (f3 << 12) | (rs1 << 15) | ((imm & 0xFFF) << 20)) & 0xFFFFFFFF
+
+        def _enc_s(opcode, f3, rs1, rs2, imm):
+            return (opcode | ((imm & 0x1F) << 7) | (f3 << 12) | (rs1 << 15) |
+                    (rs2 << 20) | (((imm >> 5) & 0x7F) << 25)) & 0xFFFFFFFF
+
+        def _enc_b(opcode, f3, rs1, rs2, imm):
+            imm_u = imm & 0xFFFFFFFF
+            return (opcode | (rs1 << 15) | (rs2 << 20) | (f3 << 12) |
+                    (((imm_u >> 12) & 1) << 31) |
+                    (((imm_u >> 5) & 0x3F) << 25) |
+                    (((imm_u >> 1) & 0xF) << 8) |
+                    (((imm_u >> 11) & 1) << 7)) & 0xFFFFFFFF
+
+        def _enc_u(opcode, rd, imm):
+            return (opcode | (rd << 7) | ((imm & 0xFFFFF) << 12)) & 0xFFFFFFFF
+
+        def _enc_j(opcode, rd, imm):
+            imm_u = imm & 0xFFFFFFFF
+            return (opcode | (rd << 7) |
+                    (((imm_u >> 20) & 1) << 31) |
+                    (((imm_u >> 1) & 0x3FF) << 21) |
+                    (((imm_u >> 11) & 1) << 20) |
+                    (((imm_u >> 12) & 0xFF) << 12)) & 0xFFFFFFFF
+
+        # Simulator: same algorithm as proofs/fam3.py's simulate_fam3.
+        # Inlined here because fam3.py defines it inside main() (not importable).
+        # Keep in sync with fam3.py if fam3 assembler semantics change.
+        def simulate_fam3(src, mnem_table, reg_table):
+            output = bytearray()
+            symbols = {}
+            fixups = []
+            pushback_token = [None]
+            pending_nl = [False]
+            frame_stack = []
+            pos = [0]
+            eot_flag = [False]
+
+            def read_char():
+                if pos[0] >= len(src):
+                    eot_flag[0] = True
+                    return '\x04'
+                ch = src[pos[0]]
+                pos[0] += 1
+                return ch
+
+            def next_token():
+                if pushback_token[0] is not None:
+                    tok = pushback_token[0]
+                    pushback_token[0] = None
+                    return tok
+                pending_nl[0] = False
+                while True:
+                    ch = read_char()
+                    if ch in ' \t\r,':
+                        continue
+                    if ch == '\n':
+                        pending_nl[0] = True
+                        continue
+                    if ch == '#':
+                        while True:
+                            ch = read_char()
+                            if ch == '\n' or ch == '\x04':
+                                if ch == '\n':
+                                    pending_nl[0] = True
+                                break
+                        if ch == '\x04':
+                            return ('EOT', '')
+                        continue
+                    if ch == '\x04':
+                        return ('EOT', '')
+                    if ch == '(':
+                        return ('LPAREN', '(')
+                    if ch == ')':
+                        return ('RPAREN', ')')
+                    if ch == '"':
+                        buf = ['"']
+                        while True:
+                            ch = read_char()
+                            buf.append(ch)
+                            if ch == '"':
+                                break
+                            if ch == '\x04':
+                                break
+                        return ('IDENT', ''.join(buf))
+                    if ch == "'":
+                        buf = ["'"]
+                        while True:
+                            ch = read_char()
+                            buf.append(ch)
+                            if ch == "'":
+                                break
+                            if ch == '\x04':
+                                break
+                        return ('IDENT', ''.join(buf))
+                    buf = [ch]
+                    while True:
+                        ch = read_char()
+                        if ch in ' \t\r\n,()#\x04':
+                            if ch == '\n':
+                                pending_nl[0] = True
+                            elif ch == '(' or ch == ')':
+                                pos[0] -= 1
+                            elif ch == '#':
+                                pos[0] -= 1
+                            elif ch == '\x04':
+                                eot_flag[0] = True
+                            break
+                        buf.append(ch)
+                    text = ''.join(buf)
+                    if text.endswith(':'):
+                        return ('LABEL', text[:-1])
+                    return ('IDENT', text)
+
+            def parse_reg(text):
+                if text.startswith('x'):
+                    try:
+                        n = int(text[1:])
+                        if 0 <= n <= 31:
+                            return n
+                    except ValueError:
+                        pass
+                return reg_table.get(text, -1)
+
+            def parse_num(text):
+                if text.startswith("'"):
+                    if len(text) == 3 and text[2] == "'":
+                        return ord(text[1])
+                    if len(text) == 4 and text[1] == '\\' and text[3] == "'":
+                        esc = {'n': 10, 't': 9, 'r': 13, '0': 0, '\\': 92, "'": 39}
+                        return esc.get(text[2], ord(text[2]))
+                neg = False
+                t = text
+                if t.startswith('-'):
+                    neg = True
+                    t = t[1:]
+                if t.startswith('0x') or t.startswith('0X'):
+                    val = int(t, 16)
+                else:
+                    val = int(t)
+                return -val if neg else val
+
+            def expect_reg():
+                _, text = next_token()
+                return parse_reg(text)
+
+            def expect_imm():
+                tok = next_token()
+                text = tok[1]
+                if text and not text[0].isdigit() and text[0] != '-' and text[0] != "'":
+                    if text in symbols:
+                        return symbols[text][0]
+                return parse_num(text)
+
+            def read_imm_or_eol():
+                saved_nl = pending_nl[0]
+                pending_nl[0] = False
+                if saved_nl:
+                    return (0, True)
+                tok = next_token()
+                if tok[0] == 'EOT':
+                    return (0, True)
+                text = tok[1]
+                if text and not text[0].isdigit() and text[0] != '-' and text[0] != "'":
+                    if text in symbols:
+                        return (symbols[text][0], False)
+                return (parse_num(text), False)
+
+            def read_mem_op():
+                imm_val = expect_imm()
+                next_token()  # LPAREN
+                rs = expect_reg()
+                next_token()  # RPAREN
+                return imm_val, rs
+
+            def cur_offset():
+                return len(output)
+
+            def emit_word(w):
+                output.extend(struct.pack('<I', w & 0xFFFFFFFF))
+
+            def emit_byte(b):
+                output.append(b & 0xFF)
+
+            def read_br_target(slot_type):
+                # Returns (offset, is_numeric). For B-type (slot_type=0), callers
+                # use a compact 4-byte branch only when is_numeric is True;
+                # label references (backward or forward) always get the relaxed
+                # 8-byte inverted-branch + JAL trampoline form.
+                tok = next_token()
+                text = tok[1]
+                try:
+                    return (parse_num(text), True)
+                except (ValueError, IndexError):
+                    pass
+                if text in symbols:
+                    # Backward label ref: offset is known, but we still relax.
+                    # Caller emits trampoline; the JAL gets patched inline below.
+                    if slot_type == 0:
+                        # Record a J-type fixup for the JAL that follows the
+                        # inverted branch (patch at cur_offset() + 4)
+                        fixups.append((text, cur_offset() + 4, 1))
+                    else:
+                        fixups.append((text, cur_offset(), slot_type))
+                    return (0, False)
+                if slot_type == 0:
+                    fixups.append((text, cur_offset() + 4, 1))
+                else:
+                    fixups.append((text, cur_offset(), slot_type))
+                return (0, False)
+
+            while True:
+                tok = next_token()
+                if tok[0] == 'EOT':
+                    break
+                if tok[0] == 'LABEL':
+                    symbols[tok[1]] = (cur_offset(), 0)
+                    continue
+                text = tok[1]
+                if not text:
+                    continue
+                if text not in mnem_table:
+                    continue
+                cls, mf3, mf7 = mnem_table[text]
+
+                if cls == 1:
+                    r_rd = expect_reg(); r_rs1 = expect_reg(); r_rs2 = expect_reg()
+                    emit_word(_enc_r(0x33, r_rd, mf3, r_rs1, r_rs2, mf7))
+                elif cls == 2:
+                    r_rd = expect_reg(); r_rs1 = expect_reg(); r_imm = expect_imm()
+                    emit_word(_enc_i(0x13, r_rd, mf3, r_rs1, r_imm))
+                elif cls == 3:
+                    r_rd = expect_reg(); r_rs1 = expect_reg(); r_imm = expect_imm()
+                    shamt = (r_imm & 0x1F) | ((mf7 & 0x7F) << 5)
+                    emit_word(_enc_i(0x13, r_rd, mf3, r_rs1, shamt))
+                elif cls == 4:
+                    r_rd = expect_reg(); r_imm, r_rs1 = read_mem_op()
+                    emit_word(_enc_i(0x03, r_rd, mf3, r_rs1, r_imm))
+                elif cls == 5:
+                    r_rs2 = expect_reg(); r_imm, r_rs1 = read_mem_op()
+                    emit_word(_enc_s(0x23, mf3, r_rs1, r_rs2, r_imm))
+                elif cls == 6:
+                    r_rs1 = expect_reg(); r_rs2 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, mf3, r_rs1, r_rs2, offset))
+                    else:
+                        inv_f3 = mf3 ^ 1
+                        emit_word(_enc_b(0x63, inv_f3, r_rs1, r_rs2, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 7:
+                    r_rd = expect_reg(); r_imm = expect_imm()
+                    emit_word(_enc_u(0x37, r_rd, r_imm))
+                elif cls == 8:
+                    r_rd = expect_reg(); r_imm = expect_imm()
+                    emit_word(_enc_u(0x17, r_rd, r_imm))
+                elif cls == 9:
+                    tok2 = next_token()
+                    r = parse_reg(tok2[1])
+                    if r >= 0:
+                        r_rd = r
+                        offset, _ = read_br_target(1)
+                    else:
+                        r_rd = 1
+                        try:
+                            offset = parse_num(tok2[1])
+                        except (ValueError, IndexError):
+                            if tok2[1] in symbols:
+                                offset = symbols[tok2[1]][0] - cur_offset()
+                            else:
+                                fixups.append((tok2[1], cur_offset(), 1))
+                                offset = 0
+                    emit_word(_enc_j(0x6F, r_rd, offset))
+                elif cls == 31:
+                    emit_word(0x00000013)
+                elif cls == 48:
+                    emit_word(0x10500073)
+                elif cls == 11:
+                    r_rd = expect_reg(); r_imm = expect_imm()
+                    if -2048 <= r_imm <= 2047:
+                        emit_word(_enc_i(0x13, r_rd, 0, 0, r_imm))
+                    else:
+                        upper = (r_imm + 0x800) >> 12
+                        lower = r_imm - (upper << 12)
+                        emit_word(_enc_u(0x37, r_rd, upper))
+                        emit_word(_enc_i(0x13, r_rd, 0, r_rd, lower))
+                elif cls == 12:
+                    r_rd = expect_reg(); r_rs = expect_reg()
+                    emit_word(_enc_i(0x13, r_rd, 0, r_rs, 0))
+                elif cls == 13:
+                    offset, _ = read_br_target(1)
+                    emit_word(_enc_j(0x6F, 0, offset))
+                elif cls == 15:
+                    r_rs1 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 0, r_rs1, 0, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 1, r_rs1, 0, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 16:
+                    r_rs1 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 1, r_rs1, 0, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 0, r_rs1, 0, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 32:
+                    r_rd = expect_reg(); r_rs = expect_reg()
+                    emit_word(_enc_r(0x33, r_rd, 0, 0, r_rs, 0x20))
+                elif cls == 33:
+                    r_rd = expect_reg(); r_rs = expect_reg()
+                    emit_word(_enc_i(0x13, r_rd, 4, r_rs, -1))
+                elif cls == 34:
+                    r_rd = expect_reg(); r_rs = expect_reg()
+                    emit_word(_enc_i(0x13, r_rd, 3, r_rs, 1))
+                elif cls == 35:
+                    r_rd = expect_reg(); r_rs = expect_reg()
+                    emit_word(_enc_r(0x33, r_rd, 3, 0, r_rs, 0))
+                elif cls == 36:
+                    r_rd = expect_reg(); r_rs = expect_reg()
+                    emit_word(_enc_r(0x33, r_rd, 2, r_rs, 0, 0))
+                elif cls == 37:
+                    r_rd = expect_reg(); r_rs = expect_reg()
+                    emit_word(_enc_r(0x33, r_rd, 2, 0, r_rs, 0))
+                elif cls == 38:
+                    r_rs1 = expect_reg(); r_rs2 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 4, r_rs2, r_rs1, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 5, r_rs2, r_rs1, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 39:
+                    r_rs1 = expect_reg(); r_rs2 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 5, r_rs2, r_rs1, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 4, r_rs2, r_rs1, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 40:
+                    r_rs1 = expect_reg(); r_rs2 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 6, r_rs2, r_rs1, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 7, r_rs2, r_rs1, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 41:
+                    r_rs1 = expect_reg(); r_rs2 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 7, r_rs2, r_rs1, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 6, r_rs2, r_rs1, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 46:
+                    r_rs1 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 4, r_rs1, 0, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 5, r_rs1, 0, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 47:
+                    r_rs1 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 5, r_rs1, 0, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 4, r_rs1, 0, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 49:
+                    r_rs1 = expect_reg()
+                    offset, is_numeric = read_br_target(0)
+                    if is_numeric:
+                        emit_word(_enc_b(0x63, 5, 0, r_rs1, offset))
+                    else:
+                        emit_word(_enc_b(0x63, 4, 0, r_rs1, 8))
+                        emit_word(_enc_j(0x6F, 0, 0))
+                elif cls == 28:
+                    r_rd = expect_reg()
+                    tok2 = next_token()
+                    label_name = tok2[1]
+                    fixups.append((label_name, cur_offset(), 7))
+                    fixups.append((label_name, cur_offset() + 4, 8))
+                    emit_word(_enc_u(0x17, r_rd, 0))
+                    emit_word(_enc_i(0x13, r_rd, 0, r_rd, 0))
+                elif cls == 17:
+                    tok2 = next_token()
+                    name = tok2[1]
+                    val = expect_imm()
+                    symbols[name] = (val, 1)
+                elif cls == 19:
+                    while True:
+                        val, done = read_imm_or_eol()
+                        if done:
+                            break
+                        emit_byte(val)
+                        if pending_nl[0] or eot_flag[0]:
+                            break
+                elif cls == 21:
+                    while True:
+                        val, done = read_imm_or_eol()
+                        if done:
+                            break
+                        emit_word(val)
+                        if pending_nl[0] or eot_flag[0]:
+                            break
+                elif cls == 22:
+                    tok2 = next_token()
+                    s = tok2[1]
+                    if s.startswith('"') and s.endswith('"'):
+                        s = s[1:-1]
+                        i = 0
+                        while i < len(s):
+                            if s[i] == '\\' and i + 1 < len(s):
+                                esc = {'n': 10, 't': 9, 'r': 13, '0': 0, '\\': 92, '"': 34}
+                                emit_byte(esc.get(s[i+1], ord(s[i+1])))
+                                i += 2
+                            else:
+                                emit_byte(ord(s[i]))
+                                i += 1
+                elif cls == 24:
+                    count = expect_imm()
+                    for _ in range(count):
+                        emit_byte(0)
+                elif cls == 42:
+                    regs_to_save = [1]
+                    while True:
+                        r = expect_reg()
+                        if r == 0:
+                            break
+                        regs_to_save.append(r)
+                    n_regs = len(regs_to_save)
+                    frame_size = ((n_regs * 4 + 15) // 16) * 16
+                    frame_stack.append((frame_size, regs_to_save))
+                    emit_word(_enc_i(0x13, 2, 0, 2, -frame_size))
+                    for idx, r in enumerate(regs_to_save):
+                        emit_word(_enc_s(0x23, 2, 2, r, idx * 4))
+                elif cls == 43:
+                    if frame_stack:
+                        frame_size, regs_to_save = frame_stack.pop()
+                        for idx, r in enumerate(regs_to_save):
+                            emit_word(_enc_i(0x03, r, 2, 2, idx * 4))
+                        emit_word(_enc_i(0x13, 2, 0, 2, frame_size))
+
+            # Resolve fixups
+            for name, patch_off, slot_type in fixups:
+                if name not in symbols:
+                    continue
+                sym_val = symbols[name][0]
+                if slot_type == 1:
+                    disp = sym_val - patch_off
+                    instr = struct.unpack_from('<I', output, patch_off)[0]
+                    instr &= 0xFFF
+                    disp_u = disp & 0xFFFFFFFF
+                    instr |= (((disp_u >> 20) & 1) << 31) | \
+                              (((disp_u >> 1) & 0x3FF) << 21) | \
+                              (((disp_u >> 11) & 1) << 20) | \
+                              (((disp_u >> 12) & 0xFF) << 12)
+                    struct.pack_into('<I', output, patch_off, instr & 0xFFFFFFFF)
+                elif slot_type == 7:
+                    disp = sym_val - patch_off
+                    instr = struct.unpack_from('<I', output, patch_off)[0]
+                    instr &= 0xFFF
+                    adjusted = disp + 0x800
+                    hi20 = (adjusted >> 12) & 0xFFFFF
+                    instr |= hi20 << 12
+                    struct.pack_into('<I', output, patch_off, instr & 0xFFFFFFFF)
+                elif slot_type == 8:
+                    auipc_off = patch_off - 4
+                    disp = sym_val - auipc_off
+                    instr = struct.unpack_from('<I', output, patch_off)[0]
+                    instr &= 0xFFFFF
+                    lo12 = disp & 0xFFF
+                    instr |= lo12 << 20
+                    struct.pack_into('<I', output, patch_off, instr & 0xFFFFFFFF)
+
+            return bytes([0x13, 0x00, 0x00, 0x00]) + bytes(output)
+
+        fam3_output = simulate_fam3(forth_src, fam3_mnem_table, fam3_reg_table)
+
+        check(f"fam3(forth.fam3) length matches bin/forth "
+              f"({len(fam3_output)} == {len(binary)})",
+              len(fam3_output) == len(binary))
+        check("fam3(forth.fam3) bytes match bin/forth exactly",
+              fam3_output == binary)
+
+        if fam3_output != binary:
+            for i in range(min(len(fam3_output), len(binary))):
+                if fam3_output[i] != binary[i]:
+                    print(f"         first mismatch at byte {i} (0x{i:04x}): "
+                          f"got 0x{fam3_output[i]:02x}, expected 0x{binary[i]:02x}")
+                    break
+
+    # ═══════════════════════════════════════════════════════════
     # [9] Branch coverage test suite
     # ═══════════════════════════════════════════════════════════
     print("\n[9] Branch coverage test suite")
@@ -2258,6 +2821,7 @@ def main():
     print(f"        [6c] concrete: {total_output_words} output words across {len(jalr_scan_programs)} programs scanned")
     print(f"    → concrete e2e: sim vs QEMU {'(compared)' if qemu_available else '(QEMU not available)'}")
     print(f"    → hello program: sim vs QEMU")
+    print(f"    → chain cross-check: fam3(forth.fam3) == bin/forth")
     print(f"    → branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
 
     return 1 if failed > 0 else 0
