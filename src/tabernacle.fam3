@@ -53,6 +53,7 @@
 .equ	NET_FAIL_CNT,		40946
 .equ	NET_FAIL_MASK,		40948
 .equ	BIND_PORT_SAVE,		40952
+.equ	TIMEOUT_TICKS,		40956
 
 # ── Networking ─────────────────────────────────────────────────────────
 .equ	VIO_DEVICE_FEATURES,	0x010
@@ -122,12 +123,12 @@ zero_loop:
 	addi	t1, t1, -1
 	bnez	t1, zero_loop
 
-	# -- Parse bind port + seed list from UART --------------------
-	# Format: "bind_port ip:port ip:port ...\004"
-	# Bind port saved in s4 (later moved to BIND_PORT_SAVE). Seeds stored at s11+SEED_LIST_OFFSET:
-	# [u8 count][6-byte entries × N]
+	# -- Parse bind port + timeout + seed list from UART ---------
+	# Format: "bind_port timeout_ms ip:port ip:port ...\004"
+	# Bind port saved in s4 (later moved to BIND_PORT_SAVE).
+	# Timeout stored at s11+TIMEOUT_TICKS (in MTIME ticks).
+	# Seeds stored at s11+SEED_LIST_OFFSET: [u8 count][6-byte entries × N]
 	li	t5, UART_BASE
-	li	s4, 0			# bind port accumulator
 	li	s6, 0			# digit accumulator
 
 	# Phase 1: read bind port (digits until space or EOT).
@@ -139,7 +140,7 @@ port_wait:
 	li	t1, 4
 	beq	t0, t1, port_eot
 	li	t1, 48
-	blt	t0, t1, port_done	# non-digit = separator
+	blt	t0, t1, port_done
 	li	t1, 58
 	bge	t0, t1, port_done
 	addi	t0, t0, -48
@@ -150,11 +151,82 @@ port_wait:
 	j	port_wait
 port_eot:
 	mv	s4, s6
-	j	parse_done
+	j	set_default_timeout
 port_done:
 	mv	s4, s6
 
-	# Phase 2: parse seed list (same as tabernacle).
+	# Phase 1b: read timeout_ms (digits until space or EOT).
+	li	s6, 0
+timeout_wait:
+	lbu	t0, UART_LSR(t5)
+	andi	t0, t0, UART_RX_READY
+	beqz	t0, timeout_wait
+	lbu	t0, 0(t5)
+	li	t1, 4
+	beq	t0, t1, timeout_eot
+	li	t1, 48
+	blt	t0, t1, timeout_done
+	li	t1, 58
+	bge	t0, t1, timeout_done
+	addi	t0, t0, -48
+	slli	t1, s6, 3
+	slli	t4, s6, 1
+	add	s6, t1, t4
+	add	s6, s6, t0
+	j	timeout_wait
+timeout_eot:
+	beqz	s6, set_default_timeout
+	j	convert_timeout_and_done
+timeout_done:
+	beqz	s6, set_default_timeout_and_parse
+	j	convert_timeout_and_parse
+
+set_default_timeout:
+	li	t0, 0x05F5E100		# 10s default
+	li	t1, TIMEOUT_TICKS
+	add	t1, s11, t1
+	sw	t0, 0(t1)
+	j	parse_done
+
+set_default_timeout_and_parse:
+	li	t0, 0x05F5E100
+	li	t1, TIMEOUT_TICKS
+	add	t1, s11, t1
+	sw	t0, 0(t1)
+	j	seed_parse_start
+
+convert_timeout_and_done:
+	# s6 * 10000: 10000 = 16384 - 4096 - 2048 - 256 + 16
+	slli	t0, s6, 14
+	slli	t1, s6, 12
+	sub	t0, t0, t1
+	slli	t1, s6, 11
+	sub	t0, t0, t1
+	slli	t1, s6, 8
+	sub	t0, t0, t1
+	slli	t1, s6, 4
+	add	t0, t0, t1
+	li	t1, TIMEOUT_TICKS
+	add	t1, s11, t1
+	sw	t0, 0(t1)
+	j	parse_done
+
+convert_timeout_and_parse:
+	slli	t0, s6, 14
+	slli	t1, s6, 12
+	sub	t0, t0, t1
+	slli	t1, s6, 11
+	sub	t0, t0, t1
+	slli	t1, s6, 8
+	sub	t0, t0, t1
+	slli	t1, s6, 4
+	add	t0, t0, t1
+	li	t1, TIMEOUT_TICKS
+	add	t1, s11, t1
+	sw	t0, 0(t1)
+
+seed_parse_start:
+	# Phase 2: parse seed list.
 	li	t2, SEED_LIST_OFFSET
 	add	t2, s11, t2
 	addi	t2, t2, 1		# skip count byte
@@ -632,11 +704,13 @@ rx_ret_probe:
 	li	t0, 2
 	beq	a0, t0, probe_got_response
 
-	# Check timeout (10 seconds since probe blast).
+	# Check timeout since probe blast.
 	li	t0, MTIME_ADDR
 	lw	t0, 0(t0)
 	sub	t1, t0, s5
-	li	t2, 0x05F5E100		# 10s = 100,000,000 ticks
+	li	t2, TIMEOUT_TICKS
+	add	t2, s11, t2
+	lw	t2, 0(t2)
 	blt	t1, t2, probe_poll
 	# Timeout — no seeds responded.
 	j	no_net
@@ -960,9 +1034,11 @@ batch_no_famc:
 	li	t0, MTIME_ADDR
 	lw	t0, 0(t0)
 
-	# Check seed timeout (10 seconds from batch start, using s4).
+	# Check seed timeout (from batch start, using s4).
 	sub	t1, t0, s4
-	li	t2, 0x05F5E100		# NET_TIMEOUT_MS * MTIME_FREQ_KHZ
+	li	t2, TIMEOUT_TICKS
+	add	t2, s11, t2
+	lw	t2, 0(t2)
 	bge	t1, t2, seed_timeout
 
 	# Check retry interval (100ms from last activity, using s5).
