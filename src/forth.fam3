@@ -110,8 +110,8 @@ read_done:
     # word 11: addi s10, s4, 0     (s10 = here+72MB, shadow underflow limit)
     # word 12: lui t1, 0x04900     (73MB)
     # word 13: add s8, t0, t1      (s8 = here+73MB, shadow upper limit)
-    # word 14: addi t1, t0, 4      (t1 = here+4, heap start)
-    # word 15: sw t1, 0(t0)        (mem[here] = here+4, init heap pointer)
+    # word 14: addi t1, t0, 1028   (reserve 1 KB pool for `var` slots, then heap)
+    # word 15: sw t1, 0(t0)        (mem[here] = t1, init heap pointer)
     # words 16-23: sw a0..a7, 0..28(s6)   (save boot registers in guard zone)
     # word 24: jal x0, +64         (skip 15-instruction error handler)
 
@@ -197,8 +197,8 @@ read_done:
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # word 14: addi t1, t0, 4 (t1 = here+4) = 0x00428313
-    lui t0, 0x00428
+    # word 14: addi t1, t0, 1028 (t1 = here+1028, past 1 KB var pool) = 0x40428313
+    lui t0, 0x40428
     addi t0, t0, 0x313
     sw t0, 0(s3)
     addi s3, s3, 4
@@ -648,6 +648,15 @@ not_rot3:
     addi t1, zero, 100         # 'd'
     beq t4, t1, emit_mod
 not_mod3:
+    # "var" = 'v','a','r'
+    addi t1, zero, 118         # 'v'
+    bne t0, t1, not_var3
+    addi t1, zero, 97          # 'a'
+    bne t3, t1, not_var3
+    addi t1, zero, 114         # 'r'
+    bne t4, t1, not_var3
+    j do_var
+not_var3:
     j not_len3
 not_len3:
 
@@ -3664,6 +3673,129 @@ patch_ok2:
     addi t6, zero, 0x6F
     or t5, t5, t6
     sw t5, 0(t2)            # patch the colon's forward jump
+    j compile_loop
+
+# ============================================================================
+# var (variable: heap-backed named cell)
+# ============================================================================
+# Each `var NAME` assigns the next slot in the 1 KB variable pool reserved
+# by the prologue at here+4..here+1028. Body pushes slot address via
+# `addi x19, x25, offset` — one instruction, no inline storage, no
+# hardcoded address. `NAME !` / `NAME @` work exactly like a C `int *` slot.
+#
+# The compile-time slot counter lives at 0x82900000 (u32, zero-init).
+do_var:
+    beqz tp, var_ok
+    j error_nested_colon
+var_ok:
+    j skip_ws_var
+skip_ws_var:
+    beq s1, s2, error_word
+    lbu t0, 0(s1)
+    addi t1, zero, 32
+    beq t0, t1, skip_var_ws
+    addi t1, zero, 10
+    beq t0, t1, skip_var_ws
+    addi t1, zero, 9
+    beq t0, t1, skip_var_ws
+    addi t1, zero, 13
+    beq t0, t1, skip_var_ws
+    j read_var_name
+skip_var_ws:
+    addi s1, s1, 1
+    j skip_ws_var
+
+read_var_name:
+    addi t2, zero, 0
+rvn_loop:
+    beq s1, s2, rvn_done
+    lbu t0, 0(s1)
+    addi t1, zero, 32
+    beq t0, t1, rvn_done
+    addi t1, zero, 10
+    beq t0, t1, rvn_done
+    addi t1, zero, 9
+    beq t0, t1, rvn_done
+    addi t1, zero, 13
+    beq t0, t1, rvn_done
+    add t3, s4, t2
+    sb t0, 0(t3)
+    addi t2, t2, 1
+    addi s1, s1, 1
+    j rvn_loop
+rvn_done:
+    add t3, s4, t2
+    sb zero, 0(t3)
+
+    # Load compile-time slot counter from 0x82900000
+    lui t5, 0x82900
+    lw t6, 0(t5)
+    # Overflow check: counter must be < 256 (pool has 256 slots)
+    addi t0, zero, 0x100
+    bltu t6, t0, var_slot_ok
+    j error_dict_overflow
+var_slot_ok:
+    # Compute slot offset: 4 + counter * 4
+    slli t0, t6, 2
+    addi t0, t0, 4
+    # Increment counter
+    addi t6, t6, 1
+    sw t6, 0(t5)
+
+    # Emit forward-jump over body: jal x0, +28 = 0x01C0006F
+    lui t1, 0x01C00
+    addi t1, t1, 0x06F
+    sw t1, 0(s3)
+    addi s3, s3, 4
+
+    # Store body_addr in dict[32]
+    sw s3, 32(s4)
+
+    # Emit body (6 instructions, 24 bytes):
+    # 1. addi x20, x20, -4 = 0xFFCA0A13 (push data stack ptr)
+    lui t1, 0xFFCA1
+    addi t1, t1, -0x5ED
+    sw t1, 0(s3)
+    addi s3, s3, 4
+    # 2. sw x19, 0(x20) = 0x013A2023 (save old TOS)
+    lui t1, 0x013A2
+    addi t1, t1, 0x023
+    sw t1, 0(s3)
+    addi s3, s3, 4
+    # 3. addi x19, x25, offset = (offset << 20) | 0x000C8993
+    slli t1, t0, 20
+    lui t2, 0x000C9
+    addi t2, t2, -0x66D
+    or t1, t1, t2
+    sw t1, 0(s3)
+    addi s3, s3, 4
+    # 4. addi x18, x18, -4 = 0xFFC90913 (pop shadow stack)
+    lui t1, 0xFFC91
+    addi t1, t1, -0x6ED
+    sw t1, 0(s3)
+    addi s3, s3, 4
+    # 5. lw x9, 0(x18) = 0x00092483 (load return ID)
+    lui t1, 0x00092
+    addi t1, t1, 0x483
+    sw t1, 0(s3)
+    addi s3, s3, 4
+    # 6. jal x0, dispatch (placeholder, added to patch list)
+    addi t1, zero, 0x6F
+    sw t1, 0(s3)
+    lui t2, 0x82850
+    bltu s11, t2, patch_ok_var
+    j error_patch_overflow
+patch_ok_var:
+    sw s3, 0(s11)
+    addi s11, s11, 4
+    addi s3, s3, 4
+
+    # Advance dict pointer
+    addi s4, s4, 36
+    lui t0, 0x82800
+    bltu s4, t0, dict_ok_var
+    j error_dict_overflow
+dict_ok_var:
     j compile_loop
 
 # ============================================================================
