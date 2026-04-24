@@ -28,6 +28,19 @@ s" full_node: boot src=" .str  __a1 .dec
 s"   size=" .str               __a2 .dec
 s"   port=" .str               __a5 .dec  cr
 
+s" full_node: first 20 bytes at __a3:" .str cr
+20 0 do __a3 i + c@ .hex loop cr
+
+\ Image layout: [fn][bible][0..3 pad][LE u32 bible_size trailer].
+\ fn_size is 4-aligned (RV32 code), so bible_start is 4-aligned too.
+: trailer-addr __a3 __a2 + 4 - ;
+: bible-sz     trailer-addr @ ;
+: bible-start  trailer-addr bible-sz - -4 and ;
+
+s" full_node: bible_size=" .str bible-sz .dec cr
+s" full_node: first 20 bytes of bible: " .str
+20 0 do bible-start i + c@ .hex loop cr
+
 __a1 1 = if
   s" full_node: writing image to disk" .str cr
   disk-init 0 = if
