@@ -576,22 +576,198 @@ def main():
             if r is not None]
     check("no RSP_CHUNK for non-FAMC payload", len(rsps) == 0)
 
+    # Scenario G: net-boot writes the verified image to disk.
+    print("\n  [G] net boot writes image to disk")
+    disk = bytes(4 * 1024 * 1024)
+    result_g = simulate(binary, base_addr=0,
+                        boot_regs=dict(a1=1, a2=bin_size, a3=0, a5=1234),
+                        disk_data=disk, max_steps=20_000_000)
+    for pc, dirs in result_g.branch_log.items():
+        all_hits.setdefault(pc, set()).update(dirs)
+    check("disk: first BIN_SIZE bytes match image",
+          result_g.disk_data[:bin_size] == binary[:bin_size])
+
+    # Scenario H: REQ_RANGE for the last (partial) chunk only.
+    last_idx = (bin_size - 1) // 1400
+    last_len = bin_size - last_idx * 1400
+    print(f"\n  [H] REQ_RANGE last chunk (idx {last_idx}, {last_len}-byte payload)")
+    result = run_scenario([make_famc_req(last_idx, last_idx)])
+    rsps = [r for r in (parse_rsp_chunk(p) for p in result.tx_packets)
+            if r is not None]
+    check("one RSP_CHUNK for partial-tail request", len(rsps) == 1)
+    if rsps:
+        check("seq == last_idx", rsps[0][0] == last_idx)
+        check("data length == BIN_SIZE - last_idx*1400",
+              len(rsps[0][1]) == last_len)
+        check("data matches tail of image",
+              rsps[0][1] == binary[last_idx * 1400:bin_size])
+
+    # Scenario I: both start and end past num_chunks → clamp collapses the
+    # range to empty. Exercises the end-clamp branch and the `start > end`
+    # guard that skips the send-loop; no chunks on the wire.
+    past = last_idx + 10
+    print(f"\n  [I] REQ_RANGE {past}..{past + 5} (both past num_chunks)")
+    result = run_scenario([make_famc_req(past, past + 5)])
+    rsps = [r for r in (parse_rsp_chunk(p) for p in result.tx_packets)
+            if r is not None]
+    check("zero chunks for past-end request", len(rsps) == 0)
+
+    # Scenario J: two ARP requests in one run — exercises rx-poll over
+    # multiple packets back-to-back.
+    print("\n  [J] two ARP requests")
+    result = run_scenario([
+        make_arp_request(),
+        make_arp_request(sender_mac=bytes([1, 2, 3, 4, 5, 6]),
+                         sender_ip=bytes([10, 0, 2, 200])),
+    ])
+    arps = [a for a in (parse_arp_reply(p) for p in result.tx_packets)
+            if a is not None]
+    check("two ARP replies", len(arps) == 2)
+
+    # Scenario K: no virtio-net present — guest should print the error
+    # message and shut down.
+    print("\n  [K] boot with no virtio-net device")
+    result = simulate(binary, base_addr=0,
+                      boot_regs=dict(a1=0, a2=bin_size, a3=0, a5=1234),
+                      net_present=False, max_steps=500_000)
+    for pc, dirs in result.branch_log.items():
+        all_hits.setdefault(pc, set()).update(dirs)
+    check("uart contains 'no virtio-net device'",
+          b'no virtio-net device' in result.uart_output)
+    check("exit reason is shutdown", result.exit_reason == 'shutdown')
+
+    # Scenario L: net-boot (a1=1) with no virtio-blk — disk-init returns
+    # 0, guest prints 'no virtio-blk' and shuts down. (Simulator's blk
+    # device only exists when disk_data is given.)
+    print("\n  [L] net boot with no virtio-blk device")
+    result = simulate(binary, base_addr=0,
+                      boot_regs=dict(a1=1, a2=bin_size, a3=0, a5=1234),
+                      disk_data=None, max_steps=1_000_000)
+    for pc, dirs in result.branch_log.items():
+        all_hits.setdefault(pc, set()).update(dirs)
+    check("uart contains 'no virtio-blk device'",
+          b'no virtio-blk device' in result.uart_output)
+
+    # Scenario M: ethernet frame with an unsupported ethertype (not ARP
+    # and not IPv4) — handle-packet falls through and drops.
+    print("\n  [M] unsupported ethertype")
+    raw = b'\x00' * 12                                  # virtio-net hdr
+    raw += GUEST_MAC + CLIENT_MAC + b'\x86\xdd'         # 0x86DD = IPv6
+    raw += b'\x00' * 40
+    result = run_scenario([raw])
+    check("no TX for unsupported ethertype", len(result.tx_packets) == 0)
+
+    # Scenario N: IPv4 with non-UDP protocol (TCP) — handle-famc drops at
+    # the protocol check.
+    print("\n  [N] IPv4 with TCP protocol")
+    tcp_hdr = bytearray(20)
+    ip_hdr = bytearray(struct.pack('>BBHHHBBHBBBBBBBB',
+        0x45, 0, 40, 0, 0, 64, 6, 0,        # 6 = TCP
+        *CLIENT_IP, *GUEST_IP))
+    ip_hdr[10], ip_hdr[11] = divmod(ip_checksum(ip_hdr), 256)
+    raw = b'\x00' * 12 + GUEST_MAC + CLIENT_MAC + b'\x08\x00' \
+        + bytes(ip_hdr) + bytes(tcp_hdr)
+    result = run_scenario([raw])
+    check("no TX for IPv4/TCP", len(result.tx_packets) == 0)
+
+    # Scenario O: ARP reply (opcode 2) instead of request — handle-arp
+    # drops on the opcode check.
+    print("\n  [O] ARP reply (should be ignored)")
+    pkt = bytearray(make_arp_request())
+    # opcode at virtio(12) + eth(14) + ARP offset 6..7 = bytes [32..33]
+    pkt[32], pkt[33] = 0, 2
+    result = run_scenario([bytes(pkt)])
+    check("no TX for ARP reply", len(result.tx_packets) == 0)
+
+    # Scenario P: REQ_RANGE with start > end where both are in valid
+    # range. The end-clamp is a no-op (end < max_idx), then start > end+1
+    # skips the send loop. Exercises the no-clamp side of `min`.
+    print("\n  [P] REQ_RANGE 10..5 (start > end, both in range)")
+    result = run_scenario([make_famc_req(10, 5)])
+    check("no chunks when start > end",
+          all(parse_rsp_chunk(p) is None for p in result.tx_packets))
+
+    # Scenario Q: runt IPv4 frame — advertised as IPv4 but shorter than
+    # 14+20+8 = 42 bytes of headers. Loads past the packet return 0 in
+    # the sim (mem dict default), so the guest sees proto=0 → not UDP →
+    # drops. Verifies no crash on truncated input.
+    print("\n  [Q] runt IPv4 frame")
+    runt = b'\x00' * 12 + GUEST_MAC + CLIENT_MAC + b'\x08\x00' \
+         + b'\x45\x00\x00\x14'       # claim len=20 but nothing follows
+    result = run_scenario([runt])
+    check("no TX for runt IPv4", len(result.tx_packets) == 0)
+
+    # Scenario R: 20 ARP requests — saturates the 16-slot RX ring and
+    # forces at least 4 rx-repost cycles to deliver the rest.
+    print("\n  [R] 20 ARP requests (ring saturation)")
+    many = [make_arp_request(sender_mac=bytes([0, 0, 0, 0, 0, i + 1]),
+                             sender_ip=bytes([10, 0, 2, 100 + i]))
+            for i in range(20)]
+    result = run_scenario(many, max_steps=10_000_000)
+    arps = [a for a in (parse_arp_reply(p) for p in result.tx_packets)
+            if a is not None]
+    check("all 20 ARP requests answered", len(arps) == 20)
+
     # ── Aggregate branch coverage across scenarios ──────────────
+    #
+    # Classify each branch as either a forth-runtime "guard" (stack
+    # underflow/overflow, shadow-stack bounds) or a "protocol" branch
+    # (everything else — ARP/IP/UDP/FAMC logic, control flow, `=` / `u<`
+    # comparisons, etc.).  Guards have a "pass" direction that's always
+    # taken and a "jump-to-error" direction that only fires on corrupted
+    # state, so bundling them into the same percentage hides how well
+    # the protocol layer is exercised.
+
+    def classify_branch(pc):
+        w = codeword_at(pc)
+        f3  = rv_funct3(w)
+        rs1 = rv_rs1(w)
+        rs2 = rv_rs2(w)
+        # Guard patterns (all bltu, f3=6):
+        #   bltu s4(20), s7(23)  — data stack underflow
+        #   bltu s6(22), s4(20)  — data stack overflow
+        #   bltu s2(18), s8(24)  — shadow stack overflow
+        #   bltu s10(26), s2(18) — shadow stack underflow
+        #   bltu *, s6           — heap upper-bound write guard
+        if f3 == 6:
+            if (rs1, rs2) in {(20, 23), (22, 20), (18, 24), (26, 18)}:
+                return 'guard'
+            if rs2 == 22:
+                return 'guard'
+        return 'protocol'
 
     branch_pcs = {pc for pc in reach
                   if rv_opcode(codeword_at(pc)) == 0x63}
+    guard_pcs    = {pc for pc in branch_pcs if classify_branch(pc) == 'guard'}
+    protocol_pcs = branch_pcs - guard_pcs
 
-    total_pairs = len(branch_pcs) * 2
-    covered = sum(len(dirs & {'T', 'N'})
-                  for pc, dirs in all_hits.items() if pc in branch_pcs)
-    pct = covered / total_pairs * 100 if total_pairs else 0
-    print(f"\n  Branch coverage: {covered}/{total_pairs} directions ({pct:.1f}%)")
-    # Most uncovered branches are in defensive checks the forth compiler
-    # injects (stack underflow, heap bounds, dispatch error). They never
-    # fire on well-formed input. The interesting question is whether the
-    # *protocol* paths are exercised — see which branches in famc.forth /
-    # arp.forth / net.forth are reached.
-    check(f"branch coverage ≥ 40% ({pct:.1f}%)", pct >= 40.0)
+    def cov(pcs):
+        total = len(pcs) * 2
+        seen = sum(len(all_hits.get(pc, set()) & {'T', 'N'}) for pc in pcs)
+        return seen, total, (seen / total * 100 if total else 0)
+
+    p_seen, p_tot, p_pct = cov(protocol_pcs)
+    g_seen, g_tot, g_pct = cov(guard_pcs)
+    a_seen, a_tot, a_pct = cov(branch_pcs)
+
+    print(f"\n  Branch coverage:")
+    print(f"    protocol branches : {p_seen:>4}/{p_tot:<4} ({p_pct:5.1f}%)  "
+          f"[{len(protocol_pcs)} branches]")
+    print(f"    runtime guards    : {g_seen:>4}/{g_tot:<4} ({g_pct:5.1f}%)  "
+          f"[{len(guard_pcs)} branches — 'taken' dir never fires on valid input]")
+    print(f"    overall           : {a_seen:>4}/{a_tot:<4} ({a_pct:5.1f}%)")
+    check(f"protocol coverage ≥ 85% ({p_pct:.1f}%)", p_pct >= 85.0)
+
+    # Where are the uncovered *protocol* directions concentrated?  Use a
+    # 256-byte band histogram so hot spots pop out.
+    missing_protocol = [(pc, d) for pc in protocol_pcs for d in ('T', 'N')
+                        if d not in all_hits.get(pc, set())]
+    if missing_protocol:
+        from collections import Counter
+        bands = Counter(pc & ~0xFF for pc, _ in missing_protocol)
+        print(f"\n  Top regions with uncovered protocol directions:")
+        for band, n in bands.most_common(6):
+            print(f"    0x{band:05x}-0x{band + 0xFF:05x}  {n} directions")
 
     # ═══════════════════════════════════════════════════════════
     # [5] Forth unit tests

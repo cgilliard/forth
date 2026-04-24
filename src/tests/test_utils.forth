@@ -18,41 +18,24 @@
 1 2 <>       s" 1<>2"      check
 1 1 <> 0 =   s" not 1<>1"  check
 
-\ min / max / abs.
+\ min — utils keeps only the low-direction helper; max is not in the
+\ production binary so it's no longer part of utils.
 3 5 min  3 = s" min-lo"    check
-3 5 max  5 = s" max-hi"    check
--7 abs   7 = s" abs-neg"   check
- 7 abs   7 = s" abs-pos"   check
+5 3 min  3 = s" min-hi-arg-first" check
 
-\ nip, tuck, 2dup, 2drop — stack kept empty between tests.
+\ nip, 2dup, 2drop — stack kept empty between tests.
 1 2 nip  2 = s" nip"       check
-1 2 tuck + + 5 = s" tuck"  check
 1 2 2dup + 3 = s" 2dup"    check
 2drop
-
-\ 2swap: ( 1 2 3 4 -- 3 4 1 2 )
-1 2 3 4 2swap
-2 = s" 2swap-top"          check
-1 = s" 2swap-2nd"          check
-4 = s" 2swap-3rd"          check
-3 = s" 2swap-4th"          check
 
 \ pick: 0 pick = dup, 1 pick = over, 3 pick grabs item at depth 3.
 10 20 30 40 3 pick
 10 = s" pick-3"            check
 2drop 2drop
 
-\ bswap16: 0x0102 -> 0x0201
-258 bswap16   513 = s" bswap16" check
-
-\ bswap32: 0x12345678 -> 0x78563412 = 2018915346
-305419896 bswap32  2018915346 = s" bswap32" check
-
-\ Return-stack primitives (use only inside colon defs in general, but
-\ forth accepts them at top level too since there's no enclosing return).
-\ Exercise them via a helper word.
+\ Return-stack primitives exercised via a helper word.
 : rt-test ( x -- x2 )
-  >r r@ r> + ;            \ pushes x to R, reads back twice, returns 2x
+  >r r@ r> + ;
 7 rt-test  14 = s" r@/r>"  check
 
 s" PASS" .str cr

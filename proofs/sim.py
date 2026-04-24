@@ -139,6 +139,7 @@ class SimResult:
     exit_reason: str
     regs:        list
     steps:       int
+    disk_data:   bytes = b''   # disk state at end of run (bytes the device sees)
 
 
 # ─── Main simulator ───────────────────────────────────────────────────
@@ -146,6 +147,7 @@ class SimResult:
 def simulate(binary, base_addr=0, boot_regs=None, uart_input=b'',
              disk_data=None, rx_packets=None, on_tx=None,
              blk_mmio_base=0x10002000, net_mmio_base=0x10001000,
+             net_present=True,
              max_steps=10_000_000, stop_when=None, mtime_step=10):
     """Run `binary` in an RV32I interpreter. See module docstring for API."""
     rx_queue = list(rx_packets or [])
@@ -172,8 +174,11 @@ def simulate(binary, base_addr=0, boot_regs=None, uart_input=b'',
 
     # Devices
     devices = {}
-    net_dev = VirtioDevice(1, net_mmio_base)
-    devices[net_mmio_base] = net_dev
+    if net_present:
+        net_dev = VirtioDevice(1, net_mmio_base)
+        devices[net_mmio_base] = net_dev
+    else:
+        net_dev = None
     if disk_data is not None:
         blk_dev = VirtioDevice(2, blk_mmio_base)
         devices[blk_mmio_base] = blk_dev
@@ -288,7 +293,7 @@ def simulate(binary, base_addr=0, boot_regs=None, uart_input=b'',
             break
 
         # Eagerly drain pending RX if possible (simulates async device).
-        if rx_queue:
+        if rx_queue and net_dev is not None:
             deliver_rx(net_dev)
 
         if pc & 0x3 or not (base_addr <= pc < base_addr + len(binary)):
@@ -459,4 +464,5 @@ def simulate(binary, base_addr=0, boot_regs=None, uart_input=b'',
         exit_reason=exit_reason,
         regs=list(regs),
         steps=step,
+        disk_data=disk_data if disk_data is not None else b'',
     )
