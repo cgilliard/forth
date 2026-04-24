@@ -507,6 +507,7 @@ def main():
         ("loop scratch",   0x82801200, 0x82801204),
         ("patch list",     0x82810000, 0x82850000),
         ("call site list", 0x82850000, 0x82890000),
+        ("var counter",    0x82900000, 0x82900004),
         ("UART",           0x10000000, 0x10000001),
         ("shutdown",       0x00100000, 0x00100004),
     ]
@@ -880,8 +881,15 @@ def main():
         "addi s10, s4, 0 (shadow underflow)": 0x000A0D13,
         "lui t1, 0x04900 (73MB)":    0x04900337,
         "add s8, t0, t1 (shadow upper)": 0x00628C33,
-        "addi t1, t0, 4 (heap start)": 0x00428313,
+        "lui t1, 0 (var-pool upper, patched)": 0x00000337,
+        "addi t1, t1, 4 (var-pool lower, patched)": 0x00430313,
+        "add t1, t1, t0 (var-pool combine)": 0x00530333,
         "sw t1, 0(t0) (heap init)":  0x0062A023,
+        "addi t2, t0, 4 (zero-loop init)": 0x00428393,
+        "beq t2, t1, +16 (zero-loop test)": 0x00638863,
+        "sw zero, 0(t2) (zero-loop store)": 0x0003A023,
+        "addi t2, t2, 4 (zero-loop inc)": 0x00438393,
+        "jal x0, -12 (zero-loop back)": 0xFF5FF06F,
         "addi s4, s4, -4 (push)":    0xFFCA0A13,
         "sw s3, 0(s4) (push TOS)":   0x013A2023,
         "lw x19, 0(x20) (pop TOS)":  0x000A2983,
@@ -1242,12 +1250,15 @@ def main():
     if bye_out and len(bye_out) >= 4:
         bye_words = [struct.unpack_from('<I', bye_out, i)[0]
                      for i in range(0, len(bye_out), 4)]
-        # PIC Prologue (17 words):
+        # PIC Prologue (32 words):
         #   0: nop, 1: lui s5, 2: auipc t0 (patched), 3: addi t0 (patched),
         #   4: addi s9, 5: lui t1 64MB, 6: add s6, 7: lui t1 72MB,
         #   8: add s4, 9: addi s2, 10: addi s7, 11: addi s10,
-        #   12: lui t1 73MB, 13: add s8, 14: addi t1 heap, 15: sw heap init,
-        #   16: jal skip
+        #   12: lui t1 73MB, 13: add s8,
+        #   14: lui t1 var-upper (patched), 15: addi t1 var-lower (patched),
+        #   16: add t1,t1,t0, 17: sw t1 heap init,
+        #   18-22: var-pool zero loop (addi/beq/sw/addi/jal),
+        #   23-30: sw a0..a7 to data region, 31: jal +64 skip error handler
         check("bye: word 0 = nop (0x00000013)", bye_words[0] == 0x00000013)
         if len(bye_words) > 1:
             check("bye: word 1 = lui s5, 0x10000 (0x10000AB7)",
@@ -1278,36 +1289,53 @@ def main():
                   bye_words[10] == 0x000A0B93)
             check("bye: word 11 = addi s10, s4, 0 (0x000A0D13)",
                   bye_words[11] == 0x000A0D13)
-        if len(bye_words) > 15:
+        if len(bye_words) > 17:
             check("bye: word 12 = lui t1, 0x04900 (0x04900337)",
                   bye_words[12] == 0x04900337)
             check("bye: word 13 = add s8, t0, t1 (0x00628C33)",
                   bye_words[13] == 0x00628C33)
-            check("bye: word 14 = addi t1, t0, 4 (0x00428313)",
-                  bye_words[14] == 0x00428313)
-            check("bye: word 15 = sw t1, 0(t0) (0x0062A023)",
-                  bye_words[15] == 0x0062A023)
-        # Words 16-23: save __a0-__a7 to data region
-        if len(bye_words) > 23:
+            # 'bye' has K=0 vars, so imm = 4 => upper=0, lower=4.
+            check("bye: word 14 = lui t1, 0 (0x00000337)",
+                  bye_words[14] == 0x00000337)
+            check("bye: word 15 = addi t1, t1, 4 (0x00430313)",
+                  bye_words[15] == 0x00430313)
+            check("bye: word 16 = add t1, t1, t0 (0x00530333)",
+                  bye_words[16] == 0x00530333)
+            check("bye: word 17 = sw t1, 0(t0) (0x0062A023)",
+                  bye_words[17] == 0x0062A023)
+        # Words 18-22: var-pool zero loop.
+        if len(bye_words) > 22:
+            check("bye: word 18 = addi t2, t0, 4 (0x00428393)",
+                  bye_words[18] == 0x00428393)
+            check("bye: word 19 = beq t2, t1, +16 (0x00638863)",
+                  bye_words[19] == 0x00638863)
+            check("bye: word 20 = sw zero, 0(t2) (0x0003A023)",
+                  bye_words[20] == 0x0003A023)
+            check("bye: word 21 = addi t2, t2, 4 (0x00438393)",
+                  bye_words[21] == 0x00438393)
+            check("bye: word 22 = jal x0, -12 (0xFF5FF06F)",
+                  bye_words[22] == 0xFF5FF06F)
+        # Words 23-30: save __a0-__a7 to data region
+        if len(bye_words) > 30:
             for i in range(8):
                 expected = [0x00AB2023, 0x00BB2223, 0x00CB2423, 0x00DB2623,
                             0x00EB2823, 0x00FB2A23, 0x010B2C23, 0x011B2E23][i]
-                check(f"bye: word {16+i} = sw a{i}, {i*4}(s6) (0x{expected:08X})",
-                      bye_words[16+i] == expected)
-        if len(bye_words) > 24:
-            check("bye: word 24 = jal x0, +64 (0x0400006F)",
-                  bye_words[24] == 0x0400006F)
-        # Error handler at words 25-39 (15 instructions)
-        if len(bye_words) > 39:
+                check(f"bye: word {23+i} = sw a{i}, {i*4}(s6) (0x{expected:08X})",
+                      bye_words[23+i] == expected)
+        if len(bye_words) > 31:
+            check("bye: word 31 = jal x0, +64 (0x0400006F)",
+                  bye_words[31] == 0x0400006F)
+        # Error handler at words 32-46 (15 instructions)
+        if len(bye_words) > 46:
             check("bye: error handler starts with addi t0, 0, 0x21",
-                  bye_words[25] == 0x02100293)
+                  bye_words[32] == 0x02100293)
             check("bye: error handler ends with jal x0, 0 (halt)",
-                  bye_words[39] == 0x0000006F)
+                  bye_words[46] == 0x0000006F)
 
         # Verify bye emits correct shutdown sequence (after prologue + error handler)
         bye_expected = [0x00100AB7, 0x000052B7, 0x55528293, 0x005AA023]
-        if len(bye_words) >= 44:
-            bye_tail = bye_words[40:44]
+        if len(bye_words) >= 51:
+            bye_tail = bye_words[47:51]
             check("bye: shutdown sequence correct",
                   bye_tail == bye_expected)
 
@@ -1796,6 +1824,10 @@ def main():
         ("word with body", ": double dup + ; 3 double drop bye", None, None),
         ("nested calls", ": a 1 ; : b a a + ; b drop bye", None, None),
         ("multi-word lookup", ": x 1 ; : y 2 ; : z x y + ; z drop bye", None, None),
+
+        # Var declarations (exercises do_var name-read and slot emit path).
+        ("single var", "var v v @ drop bye", None, None),
+        ("two vars + store", "var a var b 42 a ! 7 b ! a @ b @ + drop bye", None, None),
 
         # Whitespace variants (CR, tab, multiple)
         ("tabs and CRs", "\t\r\n bye", None, None),
