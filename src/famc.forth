@@ -44,7 +44,7 @@
   0 net-tx-buf 36 + h!be                          \ checksum placeholder
   net-tx-buf 38 + write-guest-ip
   famc-client-buf-slot @ 38 + net-tx-buf 42 + 4 copy-bytes
-  ip-checksum net-tx-buf 36 + h!be
+  net-tx-buf 26 + ip-checksum net-tx-buf 36 + h!be
 
   \ UDP header (8 bytes)
   __a5 net-tx-buf 46 + h!be                       \ src port

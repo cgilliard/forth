@@ -23,13 +23,6 @@
 : net-tx-proc-slot    aligned-base 54792 + ;
 : net-rx-desc-slot    aligned-base 54796 + ;
 
-\ ─── Guest addressing (mirrors QEMU user-mode NAT defaults) ─────────────
-
-: guest-mac-0  82 ;   : guest-mac-1  84 ;   : guest-mac-2   0 ;
-: guest-mac-3  18 ;   : guest-mac-4  52 ;   : guest-mac-5  86 ;
-: guest-ip-0   10 ;   : guest-ip-1    0 ;
-: guest-ip-2    2 ;   : guest-ip-3   15 ;
-
 \ ─── Init ──────────────────────────────────────────────────────────────
 
 : zero-net-region

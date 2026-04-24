@@ -45,8 +45,15 @@ for src in src/tests/test_*.forth; do
 	name=$(basename "$src" .forth)
 	bin="bin/$name"
 
-	# Prepend utils.forth so the test file can use those helpers.
-	(cat src/utils.forth "$src"; printf '\004') | qemu-system-riscv32 \
+	# Convention: test_X.forth auto-cats src/X.forth (if it exists and
+	# isn't utils itself, which is always prepended).
+	module=$(basename "$src" .forth | sed 's/^test_//')
+	deps="src/utils.forth"
+	if [ "$module" != "utils" ] && [ -f "src/$module.forth" ]; then
+		deps="$deps src/$module.forth"
+	fi
+
+	(cat $deps "$src"; printf '\004') | qemu-system-riscv32 \
 		-machine virt -cpu "$CPU" \
 		-display none -bios none \
 		-chardev stdio,id=ser0,mux=off,signal=off \

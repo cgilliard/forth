@@ -1,4 +1,15 @@
-\ ip.forth — byte-level packet helpers and IPv4 checksum.
+\ ip.forth — byte-level packet helpers, IPv4 addresses, and checksum.
+\
+\ Testable standalone: nothing in this file references the layout's
+\ aligned-base or device slots, so a test can cat utils.forth + ip.forth
+\ and exercise every word against a scratch buffer.
+
+\ ─── Guest addressing (mirrors QEMU user-mode NAT defaults) ─────────────
+
+: guest-mac-0  82 ;   : guest-mac-1  84 ;   : guest-mac-2   0 ;
+: guest-mac-3  18 ;   : guest-mac-4  52 ;   : guest-mac-5  86 ;
+: guest-ip-0   10 ;   : guest-ip-1    0 ;
+: guest-ip-2    2 ;   : guest-ip-3   15 ;
 
 \ ─── Byte-addressable 16-bit big-endian load/store ──────────────────────
 
@@ -35,16 +46,16 @@
 
 \ ─── IPv4 header checksum ──────────────────────────────────────────────
 \
-\ Sum the ten 16-bit words of the IP header (bytes 26..45 of the TX
-\ frame) as unsigned, fold carries twice, one's-complement the result.
-\ Caller must have written 0 at bytes 36..37 (the checksum slot) before
-\ invoking.
+\ Sum the ten 16-bit words of the 20-byte IP header at hdr-addr as
+\ unsigned, fold carries twice, one's-complement the result. Caller
+\ must have written 0 at bytes 10..11 (the checksum slot) beforehand.
 
-: ip-checksum ( -- u16 )
-  0
+: ip-checksum ( hdr-addr -- u16 )
+  0 swap
   10 0 do
-    net-tx-buf 26 + i 2 * + h@be +
-  loop
+    dup i 2 * + h@be    ( sum hdr word )
+    rot + swap          ( sum' hdr )
+  loop drop
   dup 16 rshift over 65535 and + nip
   dup 16 rshift over 65535 and + nip
   invert 65535 and ;
