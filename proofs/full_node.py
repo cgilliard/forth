@@ -35,7 +35,6 @@ Usage: python3 proofs/full_node.py
 
 import os
 import struct
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -768,24 +767,6 @@ def main():
         print(f"\n  Top regions with uncovered protocol directions:")
         for band, n in bands.most_common(6):
             print(f"    0x{band:05x}-0x{band + 0xFF:05x}  {n} directions")
-
-    # ═══════════════════════════════════════════════════════════
-    # [5] Forth unit tests
-    # ═══════════════════════════════════════════════════════════
-    print("\n[5] Forth unit tests (scripts/test.sh)")
-
-    test_sh = os.path.join(BASE, 'scripts', 'test.sh')
-    if not os.path.exists(test_sh):
-        check("scripts/test.sh exists", False)
-    else:
-        proc = subprocess.run(['sh', test_sh], cwd=BASE,
-                              capture_output=True, text=True)
-        last = proc.stdout.strip().splitlines()[-1] if proc.stdout else ""
-        print(f"  {last}")
-        check("all forth unit tests pass", proc.returncode == 0)
-        if proc.returncode != 0:
-            sys.stdout.write(proc.stdout)
-            sys.stderr.write(proc.stderr)
 
     # ═══════════════════════════════════════════════════════════
     # Summary

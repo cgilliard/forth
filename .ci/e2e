@@ -1,0 +1,7 @@
+#!/bin/sh
+# .ci/e2e — boot tabernacle under QEMU, net-load bin/full_node from a
+# local seed server, then pull the resulting disk image back via FAMC
+# and verify it matches bin/full_node byte-for-byte.
+set -e
+./scripts/build.sh
+./tests/e2e.sh

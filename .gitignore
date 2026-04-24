@@ -4,4 +4,3 @@ bin/*
 demos/*.bin
 tools/__pycache__
 proofs/__pycache__
-tests/__pscache__

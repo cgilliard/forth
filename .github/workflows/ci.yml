@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: ${{ matrix.config.platform }} - ${{ matrix.task }}
+    runs-on: ${{ matrix.config.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - platform: linux-amd64
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+        task:
+          - build
+          - tests
+          - proofs
+          - benches
+          - e2e
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check linux version
+        run: uname -a
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc python3 python3-pip
+          pip3 install --break-system-packages z3-solver
+
+      - name: ${{ matrix.task }}
+        run: ./.ci/${{ matrix.task }}
+        env:
+          PLATFORM: ${{ matrix.config.platform }}

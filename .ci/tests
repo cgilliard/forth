@@ -1,0 +1,5 @@
+#!/bin/sh
+# .ci/tests — compile and run every forth unit test.
+set -e
+./scripts/build.sh
+./tests/run.sh

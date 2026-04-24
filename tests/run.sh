@@ -1,7 +1,7 @@
 #!/bin/sh
-# scripts/test.sh — run each forth unit test under q32 and check for PASS.
+# tests/run.sh — run each forth unit test under q32 and check for PASS.
 #
-# A test file lives at src/tests/test_*.forth, is compiled with utils.forth
+# A test file lives at tests/test_*.forth, is compiled with utils.forth
 # prepended, and is expected to emit "PASS\n" on success or "FAIL: <msg>"
 # on any assertion failure.  The test binary shuts down QEMU via `bye`.
 
@@ -41,7 +41,7 @@ run_bin() {
 pass=0
 fail=0
 
-for src in src/tests/test_*.forth; do
+for src in tests/test_*.forth; do
 	name=$(basename "$src" .forth)
 	bin="bin/$name"
 

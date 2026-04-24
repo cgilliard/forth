@@ -1,5 +1,5 @@
 #!/bin/sh
-# scripts/test_e2e.sh — integration test for tabernacle + full_node + FAMC.
+# tests/e2e.sh — integration test for tabernacle + full_node + FAMC.
 #
 # Fresh disk -> net boot from a local seed server -> disk write ->
 # full_node listens on UDP 1234 (guest) / 3738 (host) -> FAMC client

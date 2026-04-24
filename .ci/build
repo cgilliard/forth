@@ -1,0 +1,5 @@
+#!/bin/sh
+# .ci/build — full build pipeline. Verifies that every stage of the
+# bootstrap chain (fam0..fam3, forth, full_node, tabernacle) compiles.
+set -e
+./scripts/build.sh

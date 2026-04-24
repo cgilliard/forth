@@ -1,0 +1,46 @@
+#!/bin/sh
+# benches/runbenches — compile and run every benches/bench_*.forth.
+#
+# Each bench is responsible for emitting its own result lines via the
+# `report` word from benches/lib.forth. Output format (per line):
+#
+#     <bench-name>/<variant>  <ticks>
+#
+# where ticks are mtime increments (10 MHz on qemu virt).
+
+set -e
+
+CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
+zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
+zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
+
+for src in benches/bench_*.forth; do
+	[ -f "$src" ] || continue
+	name=$(basename "$src" .forth | sed 's/^bench_//')
+	bin="bin/bench_$name"
+
+	# Same dep convention as scripts/test.sh: pull in src/<name>.forth and
+	# any sibling generated constants (src/<name>_*.forth) ahead of the
+	# bench file, so e.g. bench_blake2s picks up blake2s_sigma.forth.
+	deps="src/utils.forth benches/lib.forth"
+	for aux in src/${name}_*.forth; do
+		[ -f "$aux" ] && deps="$deps $aux"
+	done
+	[ -f "src/$name.forth" ] && deps="$deps src/$name.forth"
+
+	(cat $deps "$src"; printf '\004') | qemu-system-riscv32 \
+		-machine virt -cpu "$CPU" \
+		-display none -bios none \
+		-chardev stdio,id=ser0,mux=off,signal=off \
+		-serial chardev:ser0 \
+		-device loader,file=bin/forth,addr=0x80000000 \
+		> "$bin" 2>/dev/null
+
+	qemu-system-riscv32 \
+		-machine virt -cpu "$CPU" \
+		-display none -bios none \
+		-chardev stdio,id=ser0,mux=off,signal=off \
+		-serial chardev:ser0 \
+		-device loader,file="$bin",addr=0x80000000 \
+		< /dev/null 2>/dev/null
+done

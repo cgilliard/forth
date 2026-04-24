@@ -1,0 +1,6 @@
+#!/bin/sh
+# .ci/benches — compile and run every benches/bench_*.forth, printing
+# one "<name>  <mtime-ticks>" line per (bench, variant).
+set -e
+./scripts/build.sh
+./benches/runbenches
