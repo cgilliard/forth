@@ -1828,6 +1828,53 @@ def main():
         # Var declarations (exercises do_var name-read and slot emit path).
         ("single var", "var v v @ drop bye", None, None),
         ("two vars + store", "var a var b 42 a ! 7 b ! a @ b @ + drop bye", None, None),
+        # var inside a colon definition — triggers error_nested_colon (bne tp, zero)
+        ("var in colon def", ": f var v ; bye", None, None),
+        # 3-char 'v*' near-miss: miss on 2nd char (exercises var dispatch not-taken)
+        ("3-char var 2nd miss: vbr", "vbr", None, None),
+        # 3-char 'va*' near-miss: miss on 3rd char
+        ("3-char var 3rd miss: vax", "vax", None, None),
+        # var with each whitespace variant skipping TO the name (exercises
+        # do_var's skip_ws_var loop: space/newline/tab/CR).
+        ("var ws: newline", "var\nw w @ drop bye", None, None),
+        ("var ws: tab",     "var\tw w @ drop bye", None, None),
+        ("var ws: CR",      "var\rw w @ drop bye", None, None),
+        # var name terminated by each whitespace (exercises rvn_loop terminators).
+        ("var name end newline", "var w\nw @ drop bye", None, None),
+        ("var name end tab",     "var w\tw @ drop bye", None, None),
+        ("var name end CR",      "var w\rw @ drop bye", None, None),
+        # var followed by only whitespace then EOF (skip_ws_var then hit EOF)
+        ("var trailing ws then eof", "var  ", None, None),
+        # bare 'var' at end of input (skip_ws_var hits s1==s2 immediately)
+        ("var eof no name", "var", None, None),
+        # var name ends exactly at EOF (no trailing ws/newline) — rvn_loop
+        # takes the s1==s2 fall-through instead of a whitespace terminator.
+        ("var name ends at EOF", "var v", None, None),
+
+        # Bare control-closer words with no matching opener — exercises
+        # the "control stack empty" error at each pop site.
+        ("bare then", "then", None, None),
+        ("bare else", "else", None, None),
+        ("bare until", "until", None, None),
+        ("bare while", "while", None, None),
+        ("bare repeat", "repeat", None, None),
+        ("bare loop", "loop", None, None),
+        ("bare +loop", "+loop", None, None),
+        ("bare ;", ";", None, None),
+
+        # Return-stack primitives: >r, r>, r@ (exercises 2-char dispatch at 0x6a0 area)
+        (">r / r>", ": f 42 >r r> ; f drop bye", None, None),
+        ("r@ peek", ": f 42 >r r@ r> drop drop ; f bye", None, None),
+        # 2-char near-misses: '>' but not 'r', 'r' but not '>' or '@'
+        ("2-char >x near-miss", ">x", None, None),
+        ("2-char rx near-miss", "rx", None, None),
+
+        # pick (4-char word) — exercises 0xa60 dispatch
+        ("pick basic", "3 2 1 0 pick drop drop drop drop bye", None, None),
+        # 4-char pick near-misses
+        ("4-char pick 2nd miss: pxck", "pxck", None, None),
+        ("4-char pick 3rd miss: pixk", "pixk", None, None),
+        ("4-char pick 4th miss: picx", "picx", None, None),
 
         # Whitespace variants (CR, tab, multiple)
         ("tabs and CRs", "\t\r\n bye", None, None),
@@ -2268,8 +2315,23 @@ def main():
 
     # Known dead branches: (pc_addr, direction) pairs proven unreachable.
     # 0x28b0 N: check_neg_only not-taken (bare "-" always caught by
-    #           subtraction builtin at keyword dispatch before try_number)
-    dead_branches = {(0x28b0, 'N')}
+    #           subtraction builtin at keyword dispatch before try_number).
+    # 0x2d80 N: try_number with t3==0 at num_done — unreachable because
+    #           parser never produces empty words; any non-empty word either
+    #           starts with '-' (t3=1) or a non-digit (errors in num_loop).
+    # 0x2d98 N: check_neg_only with t4!=0 — the only way to reach this is
+    #           a bare "-" with the neg flag set, but bare "-" is caught by
+    #           the 1-char keyword dispatch (emit_minus) before try_number.
+    # 0x31c8 T: the 60th (last) beqz in emit_rt_check dispatch. Callers
+    #           use a0 in [0,60]; for T (a0 still nonzero at rtc59 check),
+    #           we'd need a0 > 60, but the max dispatch id emitted anywhere
+    #           in the compiler is 60.
+    dead_branches = {
+        (0x28b0, 'N'),
+        (0x2d80, 'N'),
+        (0x2d98, 'N'),
+        (0x31c8, 'T'),
+    }
 
     # Branch coverage report
     total_pairs = len(branch_pcs) * 2
