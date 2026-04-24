@@ -4,9 +4,15 @@
 : check ( flag msg-addr msg-len -- )
   rot if 2drop else s" FAIL: " .str .str cr bye then ;
 
-: in-buf   2180841472 ;   \ 0x81FD0000
-: out-buf  2180841984 ;   \ 0x81FD0200
-: exp-buf  2180842240 ;   \ 0x81FD0300
+\ Scratch buffers reserved via here/allot — no hardcoded addresses.
+\ in-buf must hold up to 192 bytes (largest test input); out-buf and
+\ exp-buf are each a 32-byte digest.
+var in-buf-cell   here 256 allot in-buf-cell  !
+var out-buf-cell  here  32 allot out-buf-cell !
+var exp-buf-cell  here  32 allot exp-buf-cell !
+: in-buf   in-buf-cell  @ ;
+: out-buf  out-buf-cell @ ;
+: exp-buf  exp-buf-cell @ ;
 
 \ Fill len bytes at addr with val.  ( val addr len -- )
 : fill

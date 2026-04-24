@@ -4,9 +4,11 @@
 : check ( flag msg-addr msg-len -- )
   rot if 2drop else s" FAIL: " .str .str cr bye then ;
 
-\ Fake queue base at 0x82000000. Queue conventions: QUEUE_NUM=16,
-\ avail at +256 (ring[i] u16 at +260 + i*2), used at +4096.
-: fq 2181038080 ;
+\ Fake queue reserved via here/allot — 16 KiB covers the queue region
+\ plus the proc slot at +8192. Queue conventions: QUEUE_NUM=16, avail
+\ at +256 (ring[i] u16 at +260 + i*2), used at +4096.
+var fq-cell   here 16384 allot fq-cell !
+: fq fq-cell @ ;
 
 \ Zero a 16 KiB queue region.
 : clear-fq

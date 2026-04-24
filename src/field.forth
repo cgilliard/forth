@@ -15,7 +15,12 @@
 \   36..39   f** result register
 \   40..43   f** base register
 
-: field-base   2181038080 ;   \ 0x82000800 — sits above blake2s-base+444
+\ Reserve the scratch region at load time via here/allot so we don't
+\ pin ourselves to a fixed address.
+var field-base-cell
+here 44 allot field-base-cell !
+: field-base field-base-cell @ ;
+
 : field-p      2013265921 ;   \ BabyBear prime
 
 : f-al     field-base       ;

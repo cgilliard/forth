@@ -1,7 +1,9 @@
 : check ( flag msg-addr msg-len -- )
   rot if 2drop else s" FAIL: " .str .str cr bye then ;
 
-: tbuf 2181038080 ;
+\ Scratch buffer reserved via here/allot — no hardcoded address.
+var tbuf-cell   here 128 allot tbuf-cell !
+: tbuf tbuf-cell @ ;
 : clear-tbuf 128 0 do 0 tbuf i + c! loop ;
 
 \ h@be / h!be
