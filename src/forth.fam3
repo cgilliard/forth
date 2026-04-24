@@ -89,12 +89,17 @@ read_done:
     lui s11, 0x82810         # 0x82810000
     # s10 = dispatch ID counter (starts at 0)
     addi s10, zero, 0
+    # Zero the compile-time var slot counter at 0x82900000.  Don't rely
+    # on RAM zero-init — even though the compiler runs under QEMU today,
+    # an explicit store avoids surprises if this file is reused.
+    lui t0, 0x82900
+    sw zero, 0(t0)
     # gp = line number counter (starts at 1)
     addi gp, zero, 1
     # tp = inside-definition flag (0 = not inside a colon definition)
     addi tp, zero, 0
 
-    # Emit PIC prologue for compiled program (25 words, patched at bye):
+    # Emit PIC prologue for compiled program (32 words, patched at bye):
     # word 0: nop (magic)
     # word 1: lui s5, 0x10000 (UART, absolute hw addr)
     # word 2: auipc t0, <upper20>  (placeholder, patched at bye)
@@ -110,10 +115,14 @@ read_done:
     # word 11: addi s10, s4, 0     (s10 = here+72MB, shadow underflow limit)
     # word 12: lui t1, 0x04900     (73MB)
     # word 13: add s8, t0, t1      (s8 = here+73MB, shadow upper limit)
-    # word 14: addi t1, t0, 1028   (reserve 1 KB pool for `var` slots, then heap)
-    # word 15: sw t1, 0(t0)        (mem[here] = t1, init heap pointer)
-    # words 16-23: sw a0..a7, 0..28(s6)   (save boot registers in guard zone)
-    # word 24: jal x0, +64         (skip 15-instruction error handler)
+    # word 14: lui  t1, <upper20>  (PATCHED at compile_done: imm = 4 + K*4)
+    # word 15: addi t1, t1, <lo12> (PATCHED at compile_done: signed split)
+    # word 16: add  t1, t1, t0     (t1 = here + imm, no 2047 cap)
+    # word 17: sw t1, 0(t0)        (mem[here] = t1, init heap pointer)
+    # words 18-22: var-pool zero loop — zeros [here+4, heap_start) so
+    #              slots are 0 on real HW too, not just QEMU
+    # words 23-30: sw a0..a7, 0..28(s6)   (save boot registers in guard zone)
+    # word 31: jal x0, +64         (skip 15-instruction error handler)
 
     # word 0: nop = 0x00000013
     addi t0, zero, 0x13
@@ -197,19 +206,60 @@ read_done:
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # word 14: addi t1, t0, 1028 (t1 = here+1028, past 1 KB var pool) = 0x40428313
-    lui t0, 0x40428
+    # word 14: lui t1, 0 (placeholder upper20, PATCHED at compile_done) = 0x00000337
+    lui t0, 0x00000
+    addi t0, t0, 0x337
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 15: addi t1, t1, 4 (placeholder lower12, PATCHED at compile_done) = 0x00430313
+    lui t0, 0x00430
     addi t0, t0, 0x313
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # word 15: sw t1, 0(t0) (init heap ptr) = 0x0062A023
+    # word 16: add t1, t1, t0 (t1 = here + imm) = 0x00530333
+    lui t0, 0x00530
+    addi t0, t0, 0x333
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # word 17: sw t1, 0(t0) (init heap ptr) = 0x0062A023
     lui t0, 0x0062A
     addi t0, t0, 0x023
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # words 16-23: save boot registers a0-a7 at s6+0..s6+28 (guard zone)
+    # Var-pool zero loop (5 instructions). At this point t0=here_base and
+    # t1=heap_start (from words 14-17). Zero [here_base+4, heap_start) so
+    # var slots start as 0 regardless of whether RAM was pre-zeroed.
+    # word 18: addi t2, t0, 4 = 0x00428393
+    lui t0, 0x00428
+    addi t0, t0, 0x393
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # word 19: beq t2, t1, +16 = 0x00638863
+    lui t0, 0x00639
+    addi t0, t0, -0x79D
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # word 20: sw zero, 0(t2) = 0x0003A023
+    lui t0, 0x0003A
+    addi t0, t0, 0x023
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # word 21: addi t2, t2, 4 = 0x00438393
+    lui t0, 0x00438
+    addi t0, t0, 0x393
+    sw t0, 0(s3)
+    addi s3, s3, 4
+    # word 22: jal x0, -12 = 0xFF5FF06F
+    lui t0, 0xFF5FF
+    addi t0, t0, 0x06F
+    sw t0, 0(s3)
+    addi s3, s3, 4
+
+    # words 23-30: save boot registers a0-a7 at s6+0..s6+28 (guard zone)
     # sw a0, 0(s6) = 0x00AB2023
     lui t0, 0x00AB2
     addi t0, t0, 0x023
@@ -251,7 +301,7 @@ read_done:
     sw t0, 0(s3)
     addi s3, s3, 4
 
-    # word 24: jal x0, +64 (skip 15-instruction error handler) = 0x0400006F
+    # word 31: jal x0, +64 (skip 15-instruction error handler) = 0x0400006F
     lui t0, 0x04000
     addi t0, t0, 0x06F
     sw t0, 0(s3)
@@ -3678,12 +3728,19 @@ patch_ok2:
 # ============================================================================
 # var (variable: heap-backed named cell)
 # ============================================================================
-# Each `var NAME` assigns the next slot in the 1 KB variable pool reserved
-# by the prologue at here+4..here+1028. Body pushes slot address via
-# `addi x19, x25, offset` — one instruction, no inline storage, no
-# hardcoded address. `NAME !` / `NAME @` work exactly like a C `int *` slot.
+# Each `var NAME` assigns the next slot in the variable pool that lives
+# at here+4..here+4+K*4, where K is the final count of `var` declarations
+# in the source.  Body pushes slot address via `addi x19, x25, offset` —
+# one instruction, no inline storage, no hardcoded address.  The pool
+# size is patched into prologue word 14 at compile_done, so a program
+# with no vars pays 0 bytes and heap starts at here+4.  The pool is
+# zeroed at startup by the loop at prologue words 16-20, so slots read
+# as 0 on real HW (no QEMU RAM-zero assumption).
 #
-# The compile-time slot counter lives at 0x82900000 (u32, zero-init).
+# The compile-time slot counter lives at 0x82900000 (u32, zeroed by the
+# compiler prologue in the main startup path before compile_loop).
+# Max K = 65536 (policy cap; the prologue's lui+addi+add sequence can
+# actually encode any imm up to ~2 GiB).
 do_var:
     beqz tp, var_ok
     j error_nested_colon
@@ -3730,10 +3787,12 @@ rvn_done:
     # Load compile-time slot counter from 0x82900000
     lui t5, 0x82900
     lw t6, 0(t5)
-    # Overflow check: counter must be < 256 (pool has 256 slots)
-    addi t0, zero, 0x100
+    # Sanity cap at 65536 vars (256 KiB of slots).  The instruction
+    # sequence at prologue 14-16 (lui+addi+add) can represent any imm
+    # up to ~2^31, so this is a policy limit, not an encoding limit.
+    lui t0, 0x10               # 0x10 << 12 = 65536
     bltu t6, t0, var_slot_ok
-    j error_dict_overflow
+    j error_var_overflow
 var_slot_ok:
     # Compute slot offset: 4 + counter * 4
     slli t0, t6, 2
@@ -4398,6 +4457,16 @@ error_dict_overflow:
     sb zero, 4(s6)
     j error_word
 
+error_var_overflow:
+    addi t0, zero, 118        # 'v'
+    sb t0, 0(s6)
+    addi t0, zero, 97         # 'a'
+    sb t0, 1(s6)
+    addi t0, zero, 114        # 'r'
+    sb t0, 2(s6)
+    sb zero, 3(s6)
+    j error_word
+
 error_output_overflow:
     addi t0, zero, 102        # 'f'
     sb t0, 0(s6)
@@ -4832,6 +4901,40 @@ disp_done:
     addi t0, zero, 0x6F     # jal x0, offset=0 loops forever
     sw t0, 0(s3)
     addi s3, s3, 4
+
+    # --- Patch var-pool size in prologue words 14-15 (lui + addi) ---
+    # Dynamic sizing: imm = 4 + K*4 where K = final var count from
+    # counter at 0x82900000.  K=0 => imm=4 (no pool, heap at here_base+4).
+    # word 14 is `lui t1, upper20`, word 15 is `addi t1, t1, lower12`,
+    # word 16 (`add t1, t1, t0`) is fixed.  Use the same upper/lower
+    # sign-split routine used for the PIC auipc/addi patch below.
+    lui t0, 0x82900
+    lw t1, 0(t0)              # t1 = K (var count)
+    slli t1, t1, 2             # K*4
+    addi t1, t1, 4             # imm = 4 + K*4 (always positive, <= 2^18 ish)
+
+    # Split imm into upper20 + lower12 with sign-extension adjustment.
+    slli t2, t1, 20
+    srli t2, t2, 20            # t2 = lower 12 bits (raw)
+    srli t3, t1, 12            # t3 = upper 20 bits (no adjust yet)
+    srli t4, t1, 11
+    andi t4, t4, 1              # t4 = bit 11 (sign of lower12)
+    add t3, t3, t4              # t3 = adjusted upper20
+
+    # Build lui t1, upper20 = (upper20 << 12) | 0x337
+    slli t4, t3, 12
+    addi t5, zero, 0x337       # (6 << 7) | 0x37 = lui t1
+    or t4, t4, t5
+    addi t5, s8, 56             # byte offset of word 14
+    sw t4, 0(t5)
+
+    # Build addi t1, t1, lower12 = (lower12 << 20) | 0x00030313
+    slli t4, t2, 20
+    lui t5, 0x00030
+    addi t5, t5, 0x313          # 0x00030313 = addi t1, t1, 0 template
+    or t4, t4, t5
+    addi t5, s8, 60             # byte offset of word 15
+    sw t4, 0(t5)
 
     # --- Patch auipc/addi for PIC (prologue words 2-3) ---
     # Must happen here (after dispatch table + safety jal) so s3 = true end.
