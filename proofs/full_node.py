@@ -506,13 +506,32 @@ def main():
 
     all_hits = {}      # accumulated branch coverage across all scenarios
 
-    def run_scenario(rx_packets, max_steps=3_000_000):
+    def run_scenario(rx_packets, expected_tx=0,
+                     max_steps=2_000_000, idle_after=80_000):
         """Boot full_node with __a1=0 and the given RX packets queued.
-        3M steps is enough to boot, init net, and emit responses for the
-        small request volumes used by the scenarios below."""
+
+        Stops as soon as `expected_tx` TX packets have been emitted AND
+        `idle_after` more steps have passed without another TX (so tests
+        that expect zero TX still get a fixed idle budget past boot to
+        confirm nothing is emitted).  Far faster than running to
+        max_steps, which for an idle server loop costs ~4s per scenario.
+        """
+        tx_count = [0]
+        quiet_since = [None]
+        def on_tx_cb(pkt, mem):
+            tx_count[0] += 1
+            quiet_since[0] = None     # reset idle timer on each TX
+        def stop_cb(step, pc, regs):
+            if tx_count[0] >= expected_tx:
+                if quiet_since[0] is None:
+                    quiet_since[0] = step
+                if step - quiet_since[0] > idle_after:
+                    return True
+            return False
         result = simulate(binary, base_addr=0, boot_regs=boot_regs,
                           uart_input=b'', rx_packets=list(rx_packets),
-                          max_steps=max_steps)
+                          max_steps=max_steps,
+                          on_tx=on_tx_cb, stop_when=stop_cb)
         for pc, dirs in result.branch_log.items():
             all_hits.setdefault(pc, set()).update(dirs)
         return result
@@ -520,7 +539,7 @@ def main():
     # Scenario A: one REQ_RANGE 0..0 — expect exactly one RSP_CHUNK whose
     # data matches the first 1400 bytes of bin/full_node.
     print("\n  [A] FAMC REQ_RANGE 0..0")
-    result = run_scenario([make_famc_req(0, 0)])
+    result = run_scenario([make_famc_req(0, 0)], expected_tx=1)
     rsps = [parse_rsp_chunk(p) for p in result.tx_packets]
     rsps = [r for r in rsps if r is not None]
     check("exactly one RSP_CHUNK emitted", len(rsps) == 1)
@@ -531,7 +550,7 @@ def main():
 
     # Scenario B: REQ_RANGE 0..3 — 4 chunks.
     print("\n  [B] FAMC REQ_RANGE 0..3")
-    result = run_scenario([make_famc_req(0, 3)])
+    result = run_scenario([make_famc_req(0, 3)], expected_tx=4)
     rsps = sorted([r for r in (parse_rsp_chunk(p) for p in result.tx_packets)
                    if r is not None])
     check("four RSP_CHUNKs emitted", len(rsps) == 4)
@@ -543,7 +562,7 @@ def main():
 
     # Scenario C: ARP request for our IP — expect ARP reply.
     print("\n  [C] ARP request for guest IP")
-    result = run_scenario([make_arp_request()])
+    result = run_scenario([make_arp_request()], expected_tx=1)
     arps = [parse_arp_reply(p) for p in result.tx_packets]
     arps = [a for a in arps if a is not None]
     check("one ARP reply", len(arps) == 1)
@@ -575,22 +594,28 @@ def main():
             if r is not None]
     check("no RSP_CHUNK for non-FAMC payload", len(rsps) == 0)
 
-    # Scenario G: net-boot writes the verified image to disk.
+    # Scenario G: net-boot writes the verified image to disk.  Passing
+    # net_present=False forces shutdown at the net-init check right
+    # after disk write completes, instead of spinning to max_steps in
+    # the main loop.
     print("\n  [G] net boot writes image to disk")
     disk = bytes(4 * 1024 * 1024)
     result_g = simulate(binary, base_addr=0,
                         boot_regs=dict(a1=1, a2=bin_size, a3=0, a5=1234),
-                        disk_data=disk, max_steps=20_000_000)
+                        disk_data=disk, net_present=False,
+                        max_steps=10_000_000)
     for pc, dirs in result_g.branch_log.items():
         all_hits.setdefault(pc, set()).update(dirs)
     check("disk: first BIN_SIZE bytes match image",
           result_g.disk_data[:bin_size] == binary[:bin_size])
+    check("net-init failed → shutdown after disk write",
+          result_g.exit_reason == 'shutdown')
 
     # Scenario H: REQ_RANGE for the last (partial) chunk only.
     last_idx = (bin_size - 1) // 1400
     last_len = bin_size - last_idx * 1400
     print(f"\n  [H] REQ_RANGE last chunk (idx {last_idx}, {last_len}-byte payload)")
-    result = run_scenario([make_famc_req(last_idx, last_idx)])
+    result = run_scenario([make_famc_req(last_idx, last_idx)], expected_tx=1)
     rsps = [r for r in (parse_rsp_chunk(p) for p in result.tx_packets)
             if r is not None]
     check("one RSP_CHUNK for partial-tail request", len(rsps) == 1)
@@ -618,7 +643,7 @@ def main():
         make_arp_request(),
         make_arp_request(sender_mac=bytes([1, 2, 3, 4, 5, 6]),
                          sender_ip=bytes([10, 0, 2, 200])),
-    ])
+    ], expected_tx=2)
     arps = [a for a in (parse_arp_reply(p) for p in result.tx_packets)
             if a is not None]
     check("two ARP replies", len(arps) == 2)
@@ -702,7 +727,7 @@ def main():
     many = [make_arp_request(sender_mac=bytes([0, 0, 0, 0, 0, i + 1]),
                              sender_ip=bytes([10, 0, 2, 100 + i]))
             for i in range(20)]
-    result = run_scenario(many, max_steps=10_000_000)
+    result = run_scenario(many, expected_tx=20, max_steps=5_000_000)
     arps = [a for a in (parse_arp_reply(p) for p in result.tx_packets)
             if a is not None]
     check("all 20 ARP requests answered", len(arps) == 20)
@@ -718,20 +743,31 @@ def main():
     # the protocol layer is exercised.
 
     def classify_branch(pc):
+        # The fixed prologue emits a 15-instruction error handler at
+        # bytes 128..188 (words 32..46). Every branch inside that range
+        # only fires when a runtime check traps, so score them as guards.
+        if 128 <= pc < 188:
+            return 'guard'
         w = codeword_at(pc)
         f3  = rv_funct3(w)
         rs1 = rv_rs1(w)
         rs2 = rv_rs2(w)
-        # Guard patterns (all bltu, f3=6):
-        #   bltu s4(20), s7(23)  — data stack underflow
-        #   bltu s6(22), s4(20)  — data stack overflow
-        #   bltu s2(18), s8(24)  — shadow stack overflow
-        #   bltu s10(26), s2(18) — shadow stack underflow
-        #   bltu *, s6           — heap upper-bound write guard
-        if f3 == 6:
+        # Guard patterns emitted inline by the forth compiler — they all
+        # skip +8 over a `jal error_handler` trap, so the "error" direction
+        # only ever fires on corrupted state.
+        if f3 == 6:  # bltu
+            #   bltu s4,  s7   — data stack underflow (TOS ptr > limit)
+            #   bltu s6,  s4   — data stack overflow  (TOS ptr < limit)
+            #   bltu s2,  s8   — shadow stack overflow
+            #   bltu s10, s2   — shadow stack underflow
+            #   bltu *,   s6   — heap upper-bound write guard
             if (rs1, rs2) in {(20, 23), (22, 20), (18, 24), (26, 18)}:
                 return 'guard'
             if rs2 == 22:
+                return 'guard'
+        if f3 == 7:  # bgeu
+            #   bgeu s3, s9    — store protection (write addr >= here base)
+            if (rs1, rs2) == (19, 25):
                 return 'guard'
         return 'protocol'
 
@@ -755,7 +791,7 @@ def main():
     print(f"    runtime guards    : {g_seen:>4}/{g_tot:<4} ({g_pct:5.1f}%)  "
           f"[{len(guard_pcs)} branches — 'taken' dir never fires on valid input]")
     print(f"    overall           : {a_seen:>4}/{a_tot:<4} ({a_pct:5.1f}%)")
-    check(f"protocol coverage ≥ 85% ({p_pct:.1f}%)", p_pct >= 85.0)
+    check(f"protocol coverage ≥ 95% ({p_pct:.1f}%)", p_pct >= 95.0)
 
     # Where are the uncovered *protocol* directions concentrated?  Use a
     # 256-byte band histogram so hot spots pop out.
