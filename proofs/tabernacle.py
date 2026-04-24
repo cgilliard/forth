@@ -1473,8 +1473,13 @@ def main():
     words = [struct.unpack_from('<I', binary, i)[0]
              for i in range(0, len(binary), 4)]
 
+    # The last 8 words (32 bytes) are the gimli hash of the payload,
+    # appended by gen_bin_config. Exclude them from the boundary scan:
+    # any of those 4-byte chunks can coincidentally match an RV32I
+    # opcode pattern in its low bits and fool the heuristic.
+    HASH_WORDS = 8
     last_code_idx = 0
-    for i in range(total_words - 1, -1, -1):
+    for i in range(total_words - 1 - HASH_WORDS, -1, -1):
         if rv_opcode(words[i]) in {0x6F, 0x63, 0x13, 0x33, 0x03, 0x23, 0x37, 0x17}:
             last_code_idx = i
             break
