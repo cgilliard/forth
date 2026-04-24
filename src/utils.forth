@@ -15,6 +15,14 @@
 : <>      = invert ;                \ ( a b -- flag )
 : min     2dup < if drop else nip then ;      \ ( a b -- min )
 
+\ ─── Memory helpers ────────────────────────────────────────────────────
+
+\ Copy n bytes from src to dst.  ( src dst n -- )
+: copy-bytes
+  0 do
+    over i + c@ over i + c!
+  loop 2drop ;
+
 \ ─── Character output ───────────────────────────────────────────────────
 
 : space   32 emit ;

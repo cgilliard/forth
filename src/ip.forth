@@ -22,12 +22,6 @@
 
 \ ─── Packet-building helpers ────────────────────────────────────────────
 
-\ Copy n bytes from src to dst.  ( src dst n -- )
-: copy-bytes
-  0 do
-    over i + c@ over i + c!
-  loop 2drop ;
-
 \ Write the guest MAC (6 bytes) at dst.
 : write-guest-mac ( dst -- )
   guest-mac-0 over 0 + c!

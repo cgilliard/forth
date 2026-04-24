@@ -45,12 +45,16 @@ for src in src/tests/test_*.forth; do
 	name=$(basename "$src" .forth)
 	bin="bin/$name"
 
-	# Convention: test_X.forth auto-cats src/X.forth (if it exists and
-	# isn't utils itself, which is always prepended).
+	# Convention: test_X.forth auto-cats src/X.forth plus any sibling
+	# src/X_*.forth files (generated constants) ahead of X.forth, so
+	# e.g. src/blake2s_sigma.forth is prepended before src/blake2s.forth.
 	module=$(basename "$src" .forth | sed 's/^test_//')
 	deps="src/utils.forth"
-	if [ "$module" != "utils" ] && [ -f "src/$module.forth" ]; then
-		deps="$deps src/$module.forth"
+	if [ "$module" != "utils" ]; then
+		for aux in src/${module}_*.forth; do
+			[ -f "$aux" ] && deps="$deps $aux"
+		done
+		[ -f "src/$module.forth" ] && deps="$deps src/$module.forth"
 	fi
 
 	(cat $deps "$src"; printf '\004') | qemu-system-riscv32 \
