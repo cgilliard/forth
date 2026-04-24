@@ -1,6 +1,0 @@
-#!/bin/sh
-# .ci/proofs — z3 structural proofs + RV32I simulator branch coverage
-# over bin/full_node.
-set -e
-./scripts/build.sh
-python3 proofs/full_node.py

@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+./scripts/build.sh
+python3 proofs/fam1.py

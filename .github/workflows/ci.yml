@@ -27,7 +27,13 @@ jobs:
         task:
           - build
           - tests
-          - proofs
+          - proof-fam0
+          - proof-fam1
+          - proof-fam2
+          - proof-fam3
+          - proof-forth
+          - proof-tabernacle
+          - proof-full_node
           - benches
           - e2e
 

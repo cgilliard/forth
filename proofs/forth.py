@@ -504,6 +504,7 @@ def main():
         ("word buffer",    0x82800000, 0x82800100),
         ("control stack",  0x82800100, 0x82801100),
         ("leave scratch",  0x82801100, 0x82801200),
+        ("loop scratch",   0x82801200, 0x82801204),
         ("patch list",     0x82810000, 0x82850000),
         ("call site list", 0x82850000, 0x82890000),
         ("UART",           0x10000000, 0x10000001),
