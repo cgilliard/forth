@@ -48,13 +48,28 @@ for src in tests/test_*.forth; do
 	# Convention: test_X.forth auto-cats src/X.forth plus any sibling
 	# src/X_*.forth files (generated constants) ahead of X.forth, so
 	# e.g. src/blake2s_sigma.forth is prepended before src/blake2s.forth.
+	#
+	# For cross-module deps, a test can declare `\ requires: a b c` in
+	# its first 10 lines; each named module is loaded (with its own
+	# aux files first, then main file) before the test's own module.
 	module=$(basename "$src" .forth | sed 's/^test_//')
 	deps="src/utils.forth"
-	if [ "$module" != "utils" ]; then
-		for aux in src/${module}_*.forth; do
+
+	add_module() {
+		for aux in src/${1}_*.forth; do
 			[ -f "$aux" ] && deps="$deps $aux"
 		done
-		[ -f "src/$module.forth" ] && deps="$deps src/$module.forth"
+		[ -f "src/$1.forth" ] && deps="$deps src/$1.forth"
+	}
+
+	requires=$(sed -n '1,10p' "$src" | grep -m1 '^\\ requires:' \
+		| sed 's/^\\ requires://')
+	for r in $requires; do
+		add_module "$r"
+	done
+
+	if [ "$module" != "utils" ]; then
+		add_module "$module"
 	fi
 
 	(cat $deps "$src"; printf '\004') | qemu-system-riscv32 \

@@ -23,6 +23,10 @@ here 44 allot field-base-cell !
 
 : field-p      2013265921 ;   \ BabyBear prime
 
+\ 1/2 in BabyBear: (p + 1)/2 = 2^30 - 2^26 + 1 = 1006632961.  Used by
+\ FRI's fold step; also handy whenever you need to halve a field value.
+: f-half   1006632961 ;
+
 : f-al     field-base       ;
 : f-ah     field-base  4 +  ;
 : f-bl     field-base  8 +  ;
@@ -137,3 +141,143 @@ here 44 allot field-base-cell !
 
 : finv ( a -- r )
   field-p 2 - f** ;
+
+\ ═══════════════════════════════════════════════════════════════════════
+\ BabyBear⁴ extension — F_p[x] / (x^4 - β), β = 11.
+\
+\ An extension element is a 16-byte block holding four base-field words:
+\   offset  0..3   a0
+\   offset  4..7   a1
+\   offset  8..11  a2
+\   offset 12..15  a3
+\
+\ All operations take element *addresses* and write to a destination
+\ address (passing 16 bytes on the data stack would be unwieldy).  c
+\ may alias a or b — the multiplication captures all 16 partial products
+\ into scratch before writing any output word, and the component-wise
+\ add/sub/neg read-then-write one component at a time.
+\ ═══════════════════════════════════════════════════════════════════════
+
+: fe-β  11 ;
+
+\ Scratch: 16 u32 slots for schoolbook partial products p[i][j] = a_i·b_j.
+var fe-pp-cell  here 64 allot fe-pp-cell !
+: fe-pp ( i j -- addr )
+  swap 2 lshift +           \ 4i + j
+  2 lshift                  \ ·4 (each slot is 4 bytes)
+  fe-pp-cell @ + ;
+
+\ ── component accessors ────────────────────────────────────────────────
+: fe@0  ( addr -- u )       @ ;
+: fe@1  ( addr -- u )  4 +  @ ;
+: fe@2  ( addr -- u )  8 +  @ ;
+: fe@3  ( addr -- u ) 12 +  @ ;
+: fe!0  ( u addr -- )       w! ;
+: fe!1  ( u addr -- )  4 +  w! ;
+: fe!2  ( u addr -- )  8 +  w! ;
+: fe!3  ( u addr -- ) 12 +  w! ;
+
+\ ── load / store / compare ─────────────────────────────────────────────
+
+: fe-zero ( c -- )
+  >r  0 r@ fe!0  0 r@ fe!1  0 r@ fe!2  0 r> fe!3 ;
+
+: fe-one ( c -- )
+  >r  1 r@ fe!0  0 r@ fe!1  0 r@ fe!2  0 r> fe!3 ;
+
+\ Store (v0, v1, v2, v3) at addr — natural reading order.
+: fe-store ( v0 v1 v2 v3 addr -- )
+  >r  r@ fe!3  r@ fe!2  r@ fe!1  r> fe!0 ;
+
+: fe-copy ( src dst -- )
+  >r
+  dup fe@0  r@ fe!0
+  dup fe@1  r@ fe!1
+  dup fe@2  r@ fe!2
+      fe@3  r> fe!3 ;
+
+: fe=? ( a b -- flag )
+  over fe@0  over fe@0  <> if 2drop 0 exit then
+  over fe@1  over fe@1  <> if 2drop 0 exit then
+  over fe@2  over fe@2  <> if 2drop 0 exit then
+  over fe@3  over fe@3  =
+  nip nip ;
+
+\ ── componentwise add / sub / neg ──────────────────────────────────────
+
+: fe+ ( a b c -- )
+  >r
+  over fe@0  over fe@0  f+  r@ fe!0
+  over fe@1  over fe@1  f+  r@ fe!1
+  over fe@2  over fe@2  f+  r@ fe!2
+  over fe@3  over fe@3  f+  r@ fe!3
+  2drop  r> drop ;
+
+: fe- ( a b c -- )
+  >r
+  over fe@0  over fe@0  f-  r@ fe!0
+  over fe@1  over fe@1  f-  r@ fe!1
+  over fe@2  over fe@2  f-  r@ fe!2
+  over fe@3  over fe@3  f-  r@ fe!3
+  2drop  r> drop ;
+
+: fe-neg ( a c -- )
+  >r
+  dup fe@0  fneg  r@ fe!0
+  dup fe@1  fneg  r@ fe!1
+  dup fe@2  fneg  r@ fe!2
+      fe@3  fneg  r> fe!3 ;
+
+\ c = a · (1/2), componentwise — multiplying by a base-field scalar
+\ doesn't need a full BB⁴ multiplication.  c may alias a.
+: fe-half ( a c -- )
+  >r
+  dup fe@0  f-half f*  r@ fe!0
+  dup fe@1  f-half f*  r@ fe!1
+  dup fe@2  f-half f*  r@ fe!2
+      fe@3  f-half f*  r> fe!3 ;
+
+\ ── multiplication mod (x^4 − β) via schoolbook ─────────────────────────
+\
+\ Compute all 16 partial products into scratch, then combine:
+\   c0 = p00 + β·(p13 + p22 + p31)
+\   c1 = p01 + p10 + β·(p23 + p32)
+\   c2 = p02 + p11 + p20 + β·p33
+\   c3 = p03 + p12 + p21 + p30
+\ where pij = a_i · b_j.  Because all partial products are captured
+\ before any write to c, the destination c may alias a or b.
+
+: fe*  ( a b c -- )
+  >r
+  \ Phase 1: compute 16 partial products.
+  over fe@0  over fe@0  f*  0 0 fe-pp w!
+  over fe@0  over fe@1  f*  0 1 fe-pp w!
+  over fe@0  over fe@2  f*  0 2 fe-pp w!
+  over fe@0  over fe@3  f*  0 3 fe-pp w!
+  over fe@1  over fe@0  f*  1 0 fe-pp w!
+  over fe@1  over fe@1  f*  1 1 fe-pp w!
+  over fe@1  over fe@2  f*  1 2 fe-pp w!
+  over fe@1  over fe@3  f*  1 3 fe-pp w!
+  over fe@2  over fe@0  f*  2 0 fe-pp w!
+  over fe@2  over fe@1  f*  2 1 fe-pp w!
+  over fe@2  over fe@2  f*  2 2 fe-pp w!
+  over fe@2  over fe@3  f*  2 3 fe-pp w!
+  over fe@3  over fe@0  f*  3 0 fe-pp w!
+  over fe@3  over fe@1  f*  3 1 fe-pp w!
+  over fe@3  over fe@2  f*  3 2 fe-pp w!
+  over fe@3  over fe@3  f*  3 3 fe-pp w!
+  2drop
+  \ Phase 2: combine and reduce x^4 = β.
+  \ c0 = p00 + β·(p13 + p22 + p31)
+  1 3 fe-pp @  2 2 fe-pp @  f+   3 1 fe-pp @  f+   fe-β f*
+  0 0 fe-pp @  f+   r@ fe!0
+  \ c1 = p01 + p10 + β·(p23 + p32)
+  2 3 fe-pp @  3 2 fe-pp @  f+   fe-β f*
+  0 1 fe-pp @  f+   1 0 fe-pp @  f+   r@ fe!1
+  \ c2 = p02 + p11 + p20 + β·p33
+  3 3 fe-pp @   fe-β f*
+  0 2 fe-pp @  f+   1 1 fe-pp @  f+   2 0 fe-pp @  f+   r@ fe!2
+  \ c3 = p03 + p12 + p21 + p30
+  0 3 fe-pp @   1 2 fe-pp @  f+   2 1 fe-pp @  f+   3 0 fe-pp @  f+
+  r@ fe!3
+  r> drop ;
